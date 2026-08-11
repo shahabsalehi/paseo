@@ -810,6 +810,185 @@ function createPaseoWorktreeForMcpTest(options: {
   };
 }
 
+describe("approval-gated forge merge MCP tool", () => {
+  const expectedHeadSha = "a".repeat(40);
+
+  function createApprovalMergeForge(overrides: Partial<ForgeService> = {}): ForgeService {
+    const base = createGitHubServiceStub();
+    const mergePullRequest = vi.fn(async () => ({ success: true as const }));
+    return {
+      ...base,
+      getPullRequest: vi.fn(async ({ number }) => ({
+        number,
+        title: `PR ${number}`,
+        url: `https://forgejo.example/acme/repo/pulls/${number}`,
+        state: mergePullRequest.mock.calls.length > 0 ? "merged" : "open",
+        body: null,
+        baseRefName: "main",
+        headRefName: "feature/exact-head",
+        labels: [],
+        updatedAt: "2026-08-11T00:00:00.000Z",
+      })),
+      getCurrentPullRequestStatus: vi.fn(async () => ({
+        number: 5,
+        repoOwner: "acme",
+        repoName: "repo",
+        url: "https://forgejo.example/acme/repo/pulls/5",
+        title: "PR 5",
+        state: "open",
+        baseRefName: "main",
+        headRefName: "feature/exact-head",
+        headSha: expectedHeadSha,
+        isMerged: false,
+        isDraft: false,
+        mergeable: "MERGEABLE",
+        checks: [],
+        checksStatus: "success",
+        reviewDecision: "approved",
+        forgeSpecific: {
+          forge: "gitea",
+          mergeable: true,
+          hasMerged: false,
+          ciStatus: "success",
+        },
+      })),
+      mergePullRequest,
+      ...overrides,
+    };
+  }
+
+  it("publishes destructive annotations and merges only the approved revision", async () => {
+    const deps = createTestDeps();
+    const forge = createApprovalMergeForge();
+    const server = await createAgentMcpServer({
+      agentManager: deps.agentManager,
+      agentStorage: deps.agentStorage,
+      providerSnapshotManager: createOpenCodeManager().manager,
+      github: forge,
+      logger: createTestLogger(),
+    });
+    const client = await connectInMemoryMcpClient(server);
+
+    try {
+      const listedTools = await client.listTools();
+      expect(
+        listedTools.tools.find((tool) => tool.name === "merge_pull_request")?.annotations,
+      ).toEqual({
+        title: "Merge an exact Forgejo pull request revision",
+        readOnlyHint: false,
+        destructiveHint: true,
+        idempotentHint: false,
+        openWorldHint: true,
+      });
+
+      const result = await client.callTool({
+        name: "merge_pull_request",
+        arguments: {
+          cwd: REPO_CWD,
+          prNumber: 5,
+          expectedHeadSha,
+          targetBranch: "main",
+          mergeMethod: "squash",
+        },
+      });
+
+      expect(result.isError).not.toBe(true);
+      expect(result.structuredContent).toEqual({
+        success: true,
+        prNumber: 5,
+        expectedHeadSha,
+        targetBranch: "main",
+        mergeMethod: "squash",
+        url: "https://forgejo.example/acme/repo/pulls/5",
+        state: "merged",
+      });
+      expect(forge.mergePullRequest).toHaveBeenCalledWith(
+        expect.objectContaining({
+          cwd: REPO_CWD,
+          prNumber: 5,
+          mergeMethod: "squash",
+          expectedHeadSha,
+        }),
+      );
+    } finally {
+      await client.close();
+      await server.close();
+    }
+  });
+
+  it("rejects a changed head before invoking the forge merge", async () => {
+    const deps = createTestDeps();
+    const forge = createApprovalMergeForge({
+      getCurrentPullRequestStatus: vi.fn(async () => ({
+        number: 5,
+        repoOwner: "acme",
+        repoName: "repo",
+        url: "https://forgejo.example/acme/repo/pulls/5",
+        title: "PR 5",
+        state: "open",
+        baseRefName: "main",
+        headRefName: "feature/exact-head",
+        headSha: "b".repeat(40),
+        isMerged: false,
+        isDraft: false,
+        mergeable: "MERGEABLE",
+        checks: [],
+        checksStatus: "success",
+        reviewDecision: "approved",
+        forgeSpecific: {
+          forge: "gitea",
+          mergeable: true,
+          hasMerged: false,
+          ciStatus: "success",
+        },
+      })),
+    });
+    const server = await createAgentMcpServer({
+      agentManager: deps.agentManager,
+      agentStorage: deps.agentStorage,
+      providerSnapshotManager: createOpenCodeManager().manager,
+      github: forge,
+      logger: createTestLogger(),
+    });
+
+    await expect(
+      invokeToolWithParsedInput(registeredTool(server, "merge_pull_request"), {
+        cwd: REPO_CWD,
+        prNumber: 5,
+        expectedHeadSha,
+        targetBranch: "main",
+        mergeMethod: "squash",
+      }),
+    ).rejects.toThrow("head changed");
+    expect(forge.mergePullRequest).not.toHaveBeenCalled();
+    await server.close();
+  });
+
+  it("does not expose the tool through native hosts that cannot carry approval annotations", async () => {
+    const deps = createTestDeps();
+    deps.spies.agentManager.getAgent.mockReturnValue(
+      createManagedAgent({
+        id: "native-agent",
+        capabilities: {
+          ...createManagedAgent().capabilities,
+          supportsNativePaseoTools: true,
+        },
+      }),
+    );
+    const server = await createAgentMcpServer({
+      agentManager: deps.agentManager,
+      agentStorage: deps.agentStorage,
+      providerSnapshotManager: createOpenCodeManager().manager,
+      github: createApprovalMergeForge(),
+      callerAgentId: "native-agent",
+      logger: createTestLogger(),
+    });
+
+    expect(lookupTool(server, "merge_pull_request")).toBeUndefined();
+    await server.close();
+  });
+});
+
 describe("browser MCP tools", () => {
   const logger = createTestLogger();
 

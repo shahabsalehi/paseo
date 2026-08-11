@@ -122,6 +122,8 @@ export interface CurrentPullRequestStatus {
   state: string;
   baseRefName: string;
   headRefName: string;
+  /** Exact remote head commit reported by the forge, when available. */
+  headSha?: string;
   isMerged: boolean;
   isDraft?: boolean;
   mergeable: PullRequestMergeable;
@@ -197,6 +199,8 @@ export interface MergePullRequestOptions {
   cwd: string;
   prNumber: number;
   mergeMethod: PullRequestMergeMethod;
+  /** Reject atomically when the pull request head no longer matches. */
+  expectedHeadSha?: string;
   status?: PullRequestCommandStatus | null;
 }
 

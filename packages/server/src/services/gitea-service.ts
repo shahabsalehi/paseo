@@ -1527,7 +1527,7 @@ export function createGiteaService(options: CreateGiteaServiceOptions = {}): For
           sha: pr.headSha,
         }),
       ]);
-      return applyGiteaChecks(status, combined, actionsRuns);
+      return applyGiteaChecks({ ...status, headSha: pr.headSha }, combined, actionsRuns);
     } catch {
       return status;
     }
@@ -1844,7 +1844,18 @@ export function createGiteaService(options: CreateGiteaServiceOptions = {}): For
 
     async mergePullRequest(input: MergePullRequestOptions): Promise<PullRequestMergeResult> {
       assertGiteaDirectMergeReady(input);
-      const args = ["pr", "merge", String(input.prNumber), "--style", input.mergeMethod];
+      const args = input.expectedHeadSha
+        ? [
+            "api",
+            "--method",
+            "POST",
+            `repos/{owner}/{repo}/pulls/${input.prNumber}/merge`,
+            "-f",
+            `Do=${input.mergeMethod}`,
+            "-f",
+            `head_commit_id=${input.expectedHeadSha}`,
+          ]
+        : ["pr", "merge", String(input.prNumber), "--style", input.mergeMethod];
       await run(args, { cwd: input.cwd });
       return { success: true };
     },

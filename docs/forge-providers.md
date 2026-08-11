@@ -104,6 +104,29 @@ host that is either a known cloud host or one the CLI is already authenticated
 to. Adapter probes must not make anonymous HTTP requests to remote-derived
 hosts, and adapters must not route credentials to an unauthenticated host.
 
+## Approval-gated merges
+
+The agent tool catalog exposes `merge_pull_request` only through MCP hosts that
+can surface destructive tool approval. Its input is the complete approval
+identity: repository cwd, PR number, expected remote head SHA, target branch,
+and merge method. The handler force-refreshes the PR and neutral status, rejects
+identity, head, target, state, draft, mergeability, checks, or review drift, and
+verifies the terminal merged state after the command.
+
+This is intentionally narrower than the app's general merge controls. The
+approval tool currently accepts only Gitea-family facts
+(`forgeSpecific.forge === "gitea"`) because Forgejo/Gitea's merge API accepts
+`head_commit_id`. The Gitea adapter must pass that value in the API request;
+the preflight alone is not an atomic guard. Other forge families stay rejected
+until their adapters implement an equivalent server-enforced expected-head
+contract.
+
+The shared `CurrentPullRequestStatus.headSha` is optional for normal status
+consumers but mandatory for this tool. Every adapter should populate it from
+the forge response when available. A best-effort status read that cannot
+resolve the remote SHA is safe for display but must fail closed for approval
+merge.
+
 ## App
 
 Each app forge splits into two modules so pure logic never imports the client

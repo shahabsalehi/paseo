@@ -453,6 +453,7 @@ describe("createGiteaService", () => {
       state: "open",
       baseRefName: "main",
       headRefName: "feat/sample-change",
+      headSha: "3333333333333333333333333333333333333333",
       isMerged: false,
       mergeable: "MERGEABLE",
       checksStatus: "pending",
@@ -1737,6 +1738,31 @@ describe("createGiteaService", () => {
 
     expect(result).toEqual({ success: true });
     expect(calls[0]).toEqual(["pr", "merge", "5", "--style", "squash"]);
+  });
+
+  it("pins an approved merge to the expected remote head through the Forgejo API", async () => {
+    const { service, calls } = makeService(() => ok(""));
+    const expectedHeadSha = "3333333333333333333333333333333333333333";
+
+    const result = await service.mergePullRequest({
+      cwd: "/repo",
+      prNumber: 5,
+      mergeMethod: "squash",
+      expectedHeadSha,
+      status: giteaMergeStatus(),
+    });
+
+    expect(result).toEqual({ success: true });
+    expect(calls[0]).toEqual([
+      "api",
+      "--method",
+      "POST",
+      "repos/{owner}/{repo}/pulls/5/merge",
+      "-f",
+      "Do=squash",
+      "-f",
+      `head_commit_id=${expectedHeadSha}`,
+    ]);
   });
 
   it("refuses to merge a pull request Gitea does not report as mergeable", async () => {

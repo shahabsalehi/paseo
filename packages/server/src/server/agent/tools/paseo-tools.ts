@@ -67,7 +67,11 @@ import {
   setAgentModeCommand,
   updateAgentCommand,
 } from "../lifecycle-command.js";
-import type { ForgeService } from "../../../services/forge-service.js";
+import type {
+  CurrentPullRequestStatus,
+  ForgeService,
+  PullRequestSummary,
+} from "../../../services/forge-service.js";
 import type { WorkspaceGitService } from "../../workspace-git-service.js";
 import type {
   PersistedWorkspaceRecord,
@@ -535,6 +539,71 @@ function resolveTerminalKeyToken(key: string, literal: boolean): string {
   }
 }
 
+function assertApprovalPullRequestIdentity(
+  pullRequest: PullRequestSummary,
+  approval: { prNumber: number; targetBranch: string },
+): void {
+  if (pullRequest.number !== approval.prNumber) {
+    throw new Error(
+      `Pull request identity changed: expected #${approval.prNumber}, found #${pullRequest.number}`,
+    );
+  }
+  if (pullRequest.state.toLowerCase() !== "open") {
+    throw new Error(`Pull request #${approval.prNumber} is not open`);
+  }
+  if (pullRequest.baseRefName !== approval.targetBranch) {
+    throw new Error(
+      `Pull request #${approval.prNumber} target changed: expected ${approval.targetBranch}, found ${pullRequest.baseRefName}`,
+    );
+  }
+}
+
+function requireApprovalMergeStatus(
+  status: CurrentPullRequestStatus | null,
+  approval: { prNumber: number; expectedHeadSha: string; targetBranch: string },
+): CurrentPullRequestStatus {
+  if (!status || status.number !== approval.prNumber) {
+    throw new Error(
+      `Pull request #${approval.prNumber} no longer resolves to approved head ${approval.expectedHeadSha}`,
+    );
+  }
+  if (status.baseRefName !== approval.targetBranch) {
+    throw new Error(
+      `Pull request #${approval.prNumber} target changed: expected ${approval.targetBranch}, found ${status.baseRefName}`,
+    );
+  }
+  if (status.headSha?.toLowerCase() !== approval.expectedHeadSha) {
+    throw new Error(
+      `Pull request #${approval.prNumber} head changed: expected ${approval.expectedHeadSha}, found ${status.headSha ?? "unknown"}`,
+    );
+  }
+  if (status.state.toLowerCase() !== "open" || status.isMerged) {
+    throw new Error(`Pull request #${approval.prNumber} is no longer open`);
+  }
+  if (status.isDraft) {
+    throw new Error(`Pull request #${approval.prNumber} is still a draft`);
+  }
+  if (status.mergeable !== "MERGEABLE") {
+    throw new Error(
+      `Pull request #${approval.prNumber} is not mergeable (status: ${status.mergeable})`,
+    );
+  }
+  if (status.checksStatus === "pending" || status.checksStatus === "failure") {
+    throw new Error(
+      `Pull request #${approval.prNumber} checks are not ready (status: ${status.checksStatus})`,
+    );
+  }
+  if (status.reviewDecision === "changes_requested") {
+    throw new Error(`Pull request #${approval.prNumber} has requested changes`);
+  }
+  if (status.forgeSpecific?.forge !== "gitea") {
+    throw new Error(
+      "Atomic head-pinned approval merges currently require a Forgejo or Gitea repository",
+    );
+  }
+  return status;
+}
+
 export function createPaseoToolCatalog(options: PaseoToolHostDependencies): PaseoToolCatalog {
   const {
     agentManager,
@@ -578,6 +647,7 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
       description: config.description ?? name,
       inputSchema: config.inputSchema,
       outputSchema: config.outputSchema,
+      annotations: config.annotations,
       handler: handler as PaseoToolDefinition["handler"],
     });
   };
@@ -3060,6 +3130,122 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
       };
     },
   );
+
+  const callerUsesNativePaseoTools = Boolean(
+    callerAgentId && agentManager.getAgent(callerAgentId)?.capabilities?.supportsNativePaseoTools,
+  );
+  if (!callerUsesNativePaseoTools) {
+    registerTool(
+      "merge_pull_request",
+      {
+        title: "Merge an exact Forgejo pull request revision",
+        description:
+          "Merge one Forgejo or Gitea pull request only when its current head SHA, target branch, checks, and mergeability still match the explicitly approved request.",
+        inputSchema: {
+          cwd: z
+            .string()
+            .optional()
+            .describe("Repository working directory. Defaults to the caller agent workspace."),
+          prNumber: z.number().int().positive().describe("Pull request number to merge."),
+          expectedHeadSha: z
+            .string()
+            .regex(/^[0-9a-fA-F]{40,64}$/)
+            .transform((value) => value.toLowerCase())
+            .describe("Exact remote pull request head SHA covered by this one-time approval."),
+          targetBranch: z
+            .string()
+            .trim()
+            .min(1)
+            .describe("Exact protected target branch covered by this one-time approval."),
+          mergeMethod: z
+            .enum(["merge", "squash", "rebase"])
+            .describe("Exact merge strategy covered by this one-time approval."),
+        },
+        outputSchema: {
+          success: z.literal(true),
+          prNumber: z.number(),
+          expectedHeadSha: z.string(),
+          targetBranch: z.string(),
+          mergeMethod: z.enum(["merge", "squash", "rebase"]),
+          url: z.string(),
+          state: z.literal("merged"),
+        },
+        annotations: {
+          title: "Merge an exact Forgejo pull request revision",
+          readOnlyHint: false,
+          destructiveHint: true,
+          idempotentHint: false,
+          openWorldHint: true,
+        },
+      },
+      async ({ cwd, prNumber, expectedHeadSha, targetBranch, mergeMethod }) => {
+        const forge = options.github;
+        if (!forge) {
+          throw new Error("Forge service is unavailable for this workspace");
+        }
+        const resolvedCwd = resolveScopedCwd(cwd);
+        const readReason = "approval-gated merge validation";
+        const pullRequest = await forge.getPullRequest({
+          cwd: resolvedCwd,
+          number: prNumber,
+          force: true,
+          reason: readReason,
+        });
+        const approval = { prNumber, expectedHeadSha, targetBranch };
+        assertApprovalPullRequestIdentity(pullRequest, approval);
+
+        const status = requireApprovalMergeStatus(
+          await forge.getCurrentPullRequestStatus({
+            cwd: resolvedCwd,
+            headRef: pullRequest.headRefName,
+            headSha: expectedHeadSha,
+            force: true,
+            reason: readReason,
+          }),
+          approval,
+        );
+
+        await forge.mergePullRequest({
+          cwd: resolvedCwd,
+          prNumber,
+          mergeMethod,
+          expectedHeadSha,
+          status,
+        });
+        forge.invalidate({ cwd: resolvedCwd });
+        const merged = await forge.getPullRequest({
+          cwd: resolvedCwd,
+          number: prNumber,
+          force: true,
+          reason: "approval-gated merge verification",
+        });
+        if (merged.state.toLowerCase() !== "merged") {
+          throw new Error(
+            `Forge accepted merge for #${prNumber}, but verification returned state ${merged.state}`,
+          );
+        }
+
+        const result = {
+          success: true as const,
+          prNumber,
+          expectedHeadSha,
+          targetBranch,
+          mergeMethod,
+          url: merged.url,
+          state: "merged" as const,
+        };
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Merged pull request #${prNumber} at ${expectedHeadSha} into ${targetBranch} with ${mergeMethod}.`,
+            },
+          ],
+          structuredContent: ensureValidJson(result),
+        };
+      },
+    );
+  }
 
   registerTool(
     "list_pending_permissions",
