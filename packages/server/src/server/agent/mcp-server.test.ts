@@ -1,8 +1,8 @@
 import { execFileSync } from "node:child_process";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
-import { describe, expect, it, vi } from "vitest";
-import { realpathSync, rmSync } from "node:fs";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { mkdtempSync, realpathSync, rmSync } from "node:fs";
 import { access, mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import { join, resolve as resolvePath } from "node:path";
 import { tmpdir } from "node:os";
@@ -182,6 +182,14 @@ async function removeTempDir(path: string): Promise<void> {
   await rm(path, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
 }
 
+const notificationTestDirs: string[] = [];
+const notificationShutdown: Array<() => void> = [];
+afterEach(() => {
+  for (const stop of notificationShutdown.splice(0)) stop();
+  for (const directory of notificationTestDirs.splice(0))
+    rmSync(directory, { recursive: true, force: true });
+});
+
 type AgentManagerSpies = ReturnType<typeof buildAgentManagerSpies>;
 type AgentStorageSpies = ReturnType<typeof buildAgentStorageSpies>;
 
@@ -197,6 +205,10 @@ interface TestDeps {
 function buildAgentManagerSpies() {
   return {
     isDispatchOwnershipEnabled: () => false,
+    onShutdown: (hook: () => void) => {
+      notificationShutdown.push(hook);
+    },
+    readHistorySnapshot: vi.fn().mockResolvedValue(null),
     createAgent: vi.fn(),
     waitForAgentEvent: vi.fn().mockResolvedValue({
       status: "idle",
@@ -233,7 +245,10 @@ function buildAgentManagerSpies() {
 }
 
 function buildAgentStorageSpies() {
+  const directory = mkdtempSync(join(tmpdir(), "paseo-mcp-inbox-"));
+  notificationTestDirs.push(directory);
   return {
+    getNotificationDirectory: () => directory,
     get: vi.fn().mockResolvedValue(null),
     setTitle: vi.fn().mockResolvedValue(undefined),
     upsert: vi.fn().mockResolvedValue(undefined),
@@ -3715,7 +3730,10 @@ describe("send_agent_prompt MCP tool", () => {
 
     const response = await tool.handler(parsed.data as Record<string, unknown>);
 
-    expect(spies.agentManager.subscribe).toHaveBeenCalledTimes(1);
+    expect(spies.agentManager.subscribe).toHaveBeenCalledWith(expect.any(Function), {
+      agentId: "child-agent",
+      replayState: false,
+    });
     expect(spies.agentManager.waitForAgentEvent).not.toHaveBeenCalled();
     expect(response.structuredContent.guidance).toBe(
       "You will get notified when the prompted agent finishes, errors, or needs permission. Do not poll for status; continue with other work until the notification arrives.",
@@ -5814,6 +5832,7 @@ describe("agent snapshot MCP serialization", () => {
       currentModeId: "default",
     } as ManagedAgent;
     spies.agentManager.getAgent
+      .mockReturnValueOnce(null)
       .mockReturnValueOnce(null)
       .mockReturnValue(snapshot)
       .mockReturnValue(snapshot);
