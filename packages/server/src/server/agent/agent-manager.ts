@@ -1,3 +1,8 @@
+import {
+  RuntimeAdmission,
+  UnconfirmedRuntimeCloseError,
+  type RuntimeLimits,
+} from "./runtime/admission.js";
 import type { PluginLifecycle } from "../plugins/lifecycle/index.js";
 import { describeHookAgent, publishAgentStream } from "../plugins/lifecycle/index.js";
 import type { PluginSessionOpenRequest } from "@getpaseo/plugin/server";
@@ -290,6 +295,7 @@ export interface CreateAgentOptions {
 }
 
 export interface AgentManagerOptions {
+  runtimeLimits?: RuntimeLimits;
   pluginLifecycle?: PluginLifecycle;
   clients?: ProviderClientMap;
   providerDefinitions?: ProviderEnabledMap;
@@ -690,6 +696,10 @@ function detachedAgentLabelPatch(labels: Record<string, string>): AgentLabelPatc
 }
 
 export class AgentManager {
+  private readonly runtimeAdmission: RuntimeAdmission | undefined;
+  private readonly idleSince = new Map<string, number>();
+  private dispatchCreationTail: Promise<unknown> = Promise.resolve();
+  private readonly idleSweepTimer: ReturnType<typeof setInterval> | undefined;
   private readonly pluginLifecycle: PluginLifecycle | undefined;
   private readonly clients = new Map<AgentProvider, AgentClient>();
   private readonly providerEnabled = new Map<AgentProvider, boolean>();
@@ -731,8 +741,12 @@ export class AgentManager {
   private acceptingAgentRegistrations = true;
 
   constructor(options: AgentManagerOptions) {
+    this.runtimeAdmission = options.runtimeLimits
+      ? new RuntimeAdmission(options.runtimeLimits)
+      : undefined;
+    this.idleSweepTimer = this.startIdleSweep();
     this.pluginLifecycle = options.pluginLifecycle;
-    this.idFactory = options?.idFactory ?? (() => randomUUID());
+    this.idFactory = options.idFactory ?? (() => randomUUID());
     this.registry = options?.registry;
     this.durableTimelineStore = options?.durableTimelineStore;
     this.onAgentAttention = options?.onAgentAttention;
@@ -762,6 +776,76 @@ export class AgentManager {
       providerDefinitions: options.providerDefinitions ?? {},
       clients: options.clients ?? {},
     });
+  }
+
+  private startIdleSweep(): ReturnType<typeof setInterval> | undefined {
+    if (!this.runtimeAdmission) return undefined;
+    const timer = setInterval(() => {
+      void this.closeIdleWorkers().catch((err) =>
+        this.logger.warn({ err }, "Idle runtime cleanup failed"),
+      );
+    }, 30_000);
+    timer.unref();
+    return timer;
+  }
+
+  serializeAgentDispatch<T>(operation: () => Promise<T>): Promise<T> {
+    const result = this.dispatchCreationTail.catch(() => undefined).then(operation);
+    this.dispatchCreationTail = result;
+    return result;
+  }
+
+  isDispatchOwnershipEnabled(): boolean {
+    return this.runtimeAdmission !== undefined;
+  }
+
+  private isWorker(labels: Record<string, string> = {}): boolean {
+    return (
+      Boolean(
+        labels[PARENT_AGENT_ID_LABEL] || labels["paseo.schedule-id"] || labels.role === "worker",
+      ) && labels.role !== "executive-assistant"
+    );
+  }
+
+  async closeIdleWorkers(now = Date.now()): Promise<void> {
+    if (!this.runtimeAdmission || !this.registry) return;
+    const limits = this.runtimeAdmission.limits;
+    const candidates = [...this.agents.values()]
+      .filter((agent) => this.isWorker(agent.labels))
+      .filter(
+        (agent) =>
+          agent.persistence &&
+          !agent.internal &&
+          (agent.lifecycle === "idle" || agent.lifecycle === "error") &&
+          !agent.activeForegroundTurnId &&
+          !this.runs.hasRun(agent.id) &&
+          agent.pendingPermissions.size === 0 &&
+          !this.providerSubagents.list(agent.id).some((child) => child.status === "running"),
+      );
+    candidates.sort(
+      (a, b) => (this.idleSince.get(a.id) ?? now) - (this.idleSince.get(b.id) ?? now),
+    );
+    for (const [index, candidate] of candidates.entries()) {
+      const observedIdleSince = this.idleSince.get(candidate.id);
+      const expired = now - (observedIdleSince ?? now) >= limits.idleMs;
+      if (!expired && index >= candidates.length - limits.maxWarmWorkers) continue;
+      await this.runLifecycleMutation(candidate.id, async () => {
+        const current = this.agents.get(candidate.id);
+        if (
+          !current ||
+          current.activeForegroundTurnId ||
+          this.runs.hasRun(current.id) ||
+          current.pendingPermissions.size ||
+          current.pendingReplacement ||
+          (current.lifecycle !== "idle" && current.lifecycle !== "error")
+        )
+          return;
+        if (this.idleSince.get(current.id) !== observedIdleSince) return;
+        if (this.providerSubagents.list(current.id).some((child) => child.status === "running"))
+          return;
+        await this.closeAgentRuntime(current.id);
+      });
+    }
   }
 
   private configurePaseoTools(options: AgentManagerOptions): void {
@@ -825,6 +909,7 @@ export class AgentManager {
 
   prepareForShutdown(): void {
     this.acceptingAgentRegistrations = false;
+    clearInterval(this.idleSweepTimer);
   }
 
   setPaseoToolsEnabled(enabled: boolean): void {
@@ -1202,7 +1287,12 @@ export class AgentManager {
     agentId: string | undefined,
     options: CreateAgentOptions,
   ): Promise<ManagedAgent> {
-    return this.trackAgentRegistrationOperation(this.createAgentInternal(config, agentId, options));
+    const id = validateAgentId(agentId ?? this.idFactory(), "createAgent");
+    const create = () => this.createAgentInternal(config, id, options);
+    const operation = this.runtimeAdmission
+      ? this.runtimeAdmission.open(id, this.isWorker(options.labels), create)
+      : create();
+    return this.trackAgentRegistrationOperation(operation);
   }
 
   private async createAgentInternal(
@@ -1282,9 +1372,13 @@ export class AgentManager {
     },
     resumeOptions?: AgentResumeSessionOptions,
   ): Promise<ManagedAgent> {
-    return this.trackAgentRegistrationOperation(
-      this.resumeAgentFromPersistenceInternal(handle, overrides, agentId, options, resumeOptions),
-    );
+    const id = validateAgentId(agentId ?? this.idFactory(), "resumeAgentFromPersistence");
+    const resume = () =>
+      this.resumeAgentFromPersistenceInternal(handle, overrides, id, options, resumeOptions);
+    const operation = this.runtimeAdmission
+      ? this.runtimeAdmission.open(id, this.isWorker(options?.labels), resume)
+      : resume();
+    return this.trackAgentRegistrationOperation(operation);
   }
 
   private async resumeAgentFromPersistenceInternal(
@@ -1358,18 +1452,26 @@ export class AgentManager {
     workspaceId: string;
     labels?: Record<string, string>;
   }): Promise<ManagedAgent> {
-    return this.trackAgentRegistrationOperation(this.importProviderSessionInternal(input));
+    const id = validateAgentId(this.idFactory(), "importProviderSession");
+    const load = () => this.importProviderSessionInternal(input, id);
+    return this.trackAgentRegistrationOperation(
+      this.runtimeAdmission
+        ? this.runtimeAdmission.open(id, this.isWorker(input.labels), load)
+        : load(),
+    );
   }
 
-  private async importProviderSessionInternal(input: {
-    provider: AgentProvider;
-    providerHandleId: string;
-    cwd: string;
-    workspaceId: string;
-    labels?: Record<string, string>;
-  }): Promise<ManagedAgent> {
+  private async importProviderSessionInternal(
+    input: {
+      provider: AgentProvider;
+      providerHandleId: string;
+      cwd: string;
+      workspaceId: string;
+      labels?: Record<string, string>;
+    },
+    resolvedAgentId: string,
+  ): Promise<ManagedAgent> {
     this.assertAcceptingAgentRegistrations();
-    const resolvedAgentId = validateAgentId(this.idFactory(), "importProviderSession");
     this.requireEnabledProvider(input.provider);
 
     const client = await this.requireAvailableClient({ provider: input.provider });
@@ -1675,8 +1777,11 @@ export class AgentManager {
     );
 
     if (closeError !== undefined) {
+      // Keep the reservation when termination is unconfirmed.
       throw closeError;
     }
+    this.runtimeAdmission?.closed(agentId);
+    this.idleSince.delete(agentId);
     if (persistError !== undefined) {
       throw persistError;
     }
@@ -2365,12 +2470,17 @@ export class AgentManager {
   }): Promise<string> {
     const { agent, agentId, pendingRun, prompt, options } = params;
     try {
+      const worker = this.isWorker(agent.labels);
+      this.runtimeAdmission?.beginTurn(agentId, worker);
+      if (worker) await this.runtimeAdmission?.limits.checkMemory();
+      if (pendingRun.settled) throw new Error(`Agent ${agentId} run canceled before admission`);
       const result = await agent.session.startTurn(prompt, options);
       if (pendingRun.settled) {
         throw new Error(`Agent ${agentId} run was canceled before its turn started`);
       }
       return result.turnId;
     } catch (error) {
+      if (!agent.activeForegroundTurnId) this.runtimeAdmission?.endTurn(agentId);
       if (pendingRun.settled) {
         throw error;
       }
@@ -2548,6 +2658,7 @@ export class AgentManager {
       nextLifecycle = "idle";
     }
     mutableAgent.lifecycle = nextLifecycle;
+    if (!shouldHoldBusyForReplacement) this.runtimeAdmission?.endTurn(agent.id);
     const persistenceHandle =
       mutableAgent.session.describePersistence() ??
       (mutableAgent.runtimeInfo?.sessionId
@@ -3462,6 +3573,7 @@ export class AgentManager {
       await session.close();
     } catch (error) {
       this.logger.warn({ err: error }, "Failed to close unregistered agent session");
+      if (this.runtimeAdmission) throw new UnconfirmedRuntimeCloseError({ cause: error });
     }
   }
 
@@ -4670,6 +4782,11 @@ export class AgentManager {
   }
 
   private emitState(agent: ManagedAgent, options?: { persist?: boolean }): void {
+    if (agent.lifecycle === "idle" || agent.lifecycle === "error") {
+      if (!this.idleSince.has(agent.id)) this.idleSince.set(agent.id, Date.now());
+    } else {
+      this.idleSince.delete(agent.id);
+    }
     // Keep attention as an edge-triggered unread signal, not a level signal.
     this.checkAndSetAttention(agent);
     if (options?.persist !== false) {
@@ -5099,6 +5216,10 @@ export class AgentManager {
       agentId,
       env: {
         ...env,
+        ...(this.runtimeAdmission ? { PASEO_MANAGED_DISPATCH: "1" } : {}),
+        ...(this.runtimeAdmission?.limits.ompConfigPath
+          ? { PASEO_OMP_DISPATCH_CONFIG: this.runtimeAdmission.limits.ompConfigPath }
+          : {}),
         PASEO_AGENT_ID: agentId,
         PASEO_AGENT_CWD: cwd,
       },
@@ -5121,7 +5242,21 @@ export class AgentManager {
     launchConfig: AgentSessionConfig,
     launchContext: AgentLaunchContext,
   ): AgentSessionConfig {
-    return launchContext.paseoTools ? stripInternalPaseoMcpServer(launchConfig) : launchConfig;
+    const config = launchContext.paseoTools
+      ? stripInternalPaseoMcpServer(launchConfig)
+      : launchConfig;
+    if (!this.runtimeAdmission || config.provider !== "codex") return config;
+    const options = z
+      .object({ features: z.record(z.string(), z.unknown()).optional() })
+      .passthrough()
+      .parse(config.providerOptions ?? {});
+    return {
+      ...config,
+      providerOptions: {
+        ...options,
+        features: { ...options.features, multi_agent: false, multi_agent_v2: false },
+      },
+    };
   }
 
   private async requireAvailableClient(options: { provider: AgentProvider }): Promise<AgentClient> {

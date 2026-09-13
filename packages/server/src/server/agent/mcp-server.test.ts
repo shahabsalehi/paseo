@@ -196,6 +196,7 @@ interface TestDeps {
 
 function buildAgentManagerSpies() {
   return {
+    isDispatchOwnershipEnabled: () => false,
     createAgent: vi.fn(),
     waitForAgentEvent: vi.fn().mockResolvedValue({
       status: "idle",

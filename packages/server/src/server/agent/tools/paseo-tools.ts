@@ -1,3 +1,4 @@
+import { assertDispatchOwnership, isDispatchControlTool } from "../runtime/ownership.js";
 import { z } from "zod";
 import { ensureValidJson } from "../../json-utils.js";
 import type { Logger } from "pino";
@@ -588,7 +589,49 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
       description: config.description ?? name,
       inputSchema: config.inputSchema,
       outputSchema: config.outputSchema,
-      handler: handler as PaseoToolDefinition["handler"],
+      handler: async (input, context) => {
+        const execute = async () => {
+          if (
+            callerAgentId &&
+            isDispatchControlTool(name) &&
+            agentManager.isDispatchOwnershipEnabled()
+          ) {
+            const caller =
+              agentManager.getAgent(callerAgentId) ?? (await agentStorage.get(callerAgentId));
+            if (!caller) throw new Error("Dispatch caller no longer exists");
+            const args = z
+              .object({
+                agentId: z.string().optional(),
+                labels: z.record(z.string(), z.string()).default({}),
+              })
+              .passthrough()
+              .parse(input);
+            const records = await agentStorage.list();
+            const children = records.filter(
+              (record) =>
+                record.labels["paseo.parent-agent-id"] === callerAgentId && !record.archivedAt,
+            );
+            const target = args.agentId
+              ? (agentManager.getAgent(args.agentId) ?? (await agentStorage.get(args.agentId)))
+              : null;
+            assertDispatchOwnership({
+              caller,
+              tool: name,
+              target,
+              labels: args.labels,
+              hasExecutiveAssistant: children.some(
+                (child) => child.labels.role === "executive-assistant",
+              ),
+              workerCount: children.filter((child) => child.labels.role !== "executive-assistant")
+                .length,
+            });
+          }
+          return handler(input, context);
+        };
+        return name === "create_agent" && agentManager.isDispatchOwnershipEnabled()
+          ? agentManager.serializeAgentDispatch(execute)
+          : execute();
+      },
     });
   };
   const toCatalog = (): PaseoToolCatalog => ({
@@ -1430,7 +1473,7 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
       let notifyOnFinish: boolean;
       if (resolvedArgs.kind === "agent-scoped") {
         requestedBackground = true;
-        notifyOnFinish = parsedArgs.notifyOnFinish;
+        notifyOnFinish = agentManager.isDispatchOwnershipEnabled() || parsedArgs.notifyOnFinish;
       } else {
         requestedBackground = resolvedArgs.parsedArgs.background;
         notifyOnFinish = resolvedArgs.parsedArgs.notifyOnFinish ?? false;
@@ -1887,7 +1930,11 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
       background = Boolean(callerAgentId),
       notifyOnFinish = Boolean(callerAgentId),
     }) => {
-      const shouldNotifyOnFinish = Boolean(callerAgentId && notifyOnFinish && background);
+      const shouldNotifyOnFinish = Boolean(
+        callerAgentId &&
+        background &&
+        (notifyOnFinish || agentManager.isDispatchOwnershipEnabled()),
+      );
 
       await sendPromptToAgent({
         agentManager,

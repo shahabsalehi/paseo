@@ -97,6 +97,11 @@ export function buildOmpLaunch(input: {
   const protocolMode = input.session.protocolMode ?? "rpc";
   const systemPrompt = input.session.systemPrompt?.trim();
   appendOmpLaunchArgs(argv, input.session, protocolMode, systemPrompt);
+  if (input.session.env?.PASEO_MANAGED_DISPATCH === "1") {
+    const configPath = input.session.env.PASEO_OMP_DISPATCH_CONFIG;
+    if (!configPath) throw new Error("Managed OMP dispatch requires its settings overlay");
+    argv.push("--config", configPath);
+  }
 
   return {
     cwd: input.session.cwd,
