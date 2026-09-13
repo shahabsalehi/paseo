@@ -952,12 +952,6 @@ export async function createPaseoDaemon(
   );
   await agentStorage.initialize();
   logger.info({ elapsed: elapsed() }, "Agent storage initialized");
-  initializeAgentNotifications(
-    agentManager,
-    agentStorage,
-    logger,
-    process.env.PASEO_DISPATCH_QUEUE,
-  );
   await bootstrapWorkspaceRegistries({
     serverId,
     paseoHome: config.paseoHome,
@@ -1731,6 +1725,13 @@ export async function createPaseoDaemon(
             pluginRuntime.bindPaseoSessionHost(wsServer);
             await pluginRuntime.start();
             wsServer.beginAcceptingConnections();
+            initializeAgentNotifications(
+              agentManager,
+              agentStorage,
+              logger,
+              process.env.PASEO_DISPATCH_QUEUE,
+            );
+
             relayRuntime = createRelayRuntime({
               config: {
                 enabled: relayEnabled,
