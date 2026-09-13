@@ -1,4 +1,4 @@
-import { expect, test } from "vitest";
+import { expect, test, vi } from "vitest";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -8,6 +8,7 @@ import { ensureAgentLoaded } from "../agent-loading.js";
 import { createTestAgentClient } from "../../test-utils/fake-agent-client.js";
 import { createTestLogger } from "../../../test-utils/test-logger.js";
 import { DEFAULT_RUNTIME_LIMITS } from "./admission.js";
+import { CodexProviderOptionsSchema } from "../providers/codex/options.js";
 
 test("idle worker closes without archiving and resumes the same durable session", async () => {
   const dir = await mkdtemp(join(tmpdir(), "paseo-idle-"));
@@ -71,17 +72,26 @@ test.each(
     const logger = createTestLogger();
     const storage = new AgentStorage(join(dir, "agents"), logger);
     await storage.initialize();
+    const client = createTestAgentClient(provider);
+    const createSession = vi.spyOn(client, "createSession");
+    const resumeSession = vi.spyOn(client, "resumeSession");
     const manager = new AgentManager({
       logger,
       registry: storage,
       historyDirectory: join(dir, "history"),
-      clients: { [provider]: createTestAgentClient(provider) },
+      clients: { [provider]: client },
       runtimeLimits: { ...DEFAULT_RUNTIME_LIMITS, checkMemory: async () => {} },
     });
     try {
       const agent = await manager.createAgent({ provider, cwd: dir }, undefined, {
         labels: { role },
       });
+      if (provider === "codex") {
+        // Use the real provider schema; fake sessions otherwise accept invalid options.
+        expect(() =>
+          CodexProviderOptionsSchema.parse(createSession.mock.calls[0][0].providerOptions),
+        ).not.toThrow();
+      }
       await manager.appendTimelineItem(agent.id, {
         type: "assistant_message",
         text: "Keep this history",
@@ -104,6 +114,11 @@ test.each(
         logger,
       });
       expect(resumed.persistence?.sessionId).toBe(agent.persistence?.sessionId);
+      if (provider === "codex") {
+        expect(() =>
+          CodexProviderOptionsSchema.parse(resumeSession.mock.calls[0][1]?.providerOptions),
+        ).not.toThrow();
+      }
       await manager.closeAgent(agent.id);
     } finally {
       manager.prepareForShutdown();

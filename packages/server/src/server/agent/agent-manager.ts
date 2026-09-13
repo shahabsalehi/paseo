@@ -5301,7 +5301,7 @@ export class AgentManager {
       ...config,
       providerOptions: {
         ...options,
-        features: { ...options.features, multi_agent: false, multi_agent_v2: false },
+        features: { ...options.features, multi_agent_v2: false },
       },
     };
   }
