@@ -74,3 +74,21 @@ test("an unconfirmed provider shutdown does not free a resident slot", async () 
     "resident runtime limit",
   );
 });
+
+test("a registration error cannot release a runtime already owned by the manager", async () => {
+  const gate = new RuntimeAdmission(
+    {
+      ...DEFAULT_RUNTIME_LIMITS,
+      maxResident: 1,
+      coordinatorReserve: 0,
+      checkMemory: async () => {},
+    },
+    () => true,
+  );
+  await expect(
+    gate.open("registered", true, async () => {
+      throw new Error("snapshot persistence failed");
+    }),
+  ).rejects.toThrow("snapshot persistence failed");
+  await expect(gate.open("extra", true, async () => {})).rejects.toThrow("resident runtime limit");
+});

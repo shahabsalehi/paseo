@@ -742,7 +742,7 @@ export class AgentManager {
 
   constructor(options: AgentManagerOptions) {
     this.runtimeAdmission = options.runtimeLimits
-      ? new RuntimeAdmission(options.runtimeLimits)
+      ? new RuntimeAdmission(options.runtimeLimits, (id) => this.agents.has(id))
       : undefined;
     this.idleSweepTimer = this.startIdleSweep();
     this.pluginLifecycle = options.pluginLifecycle;
@@ -1659,8 +1659,15 @@ export class AgentManager {
         if (session) {
           await this.closeUnregisteredSession(session);
         }
+        this.releaseClosedRuntime(closedExisting);
       }
     }
+  }
+
+  private releaseClosedRuntime(agent: ManagedAgentClosed | undefined): void {
+    if (!agent) return;
+    this.runtimeAdmission?.closed(agent.id);
+    this.idleSince.delete(agent.id);
   }
 
   private async closeReloadedSession(session: AgentSession, agentId: string): Promise<void> {
@@ -1780,8 +1787,7 @@ export class AgentManager {
       // Keep the reservation when termination is unconfirmed.
       throw closeError;
     }
-    this.runtimeAdmission?.closed(agentId);
-    this.idleSince.delete(agentId);
+    this.releaseClosedRuntime(closedAgent);
     if (persistError !== undefined) {
       throw persistError;
     }

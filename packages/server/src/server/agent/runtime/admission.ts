@@ -44,7 +44,10 @@ export class RuntimeAdmission {
   private readonly executing = new Map<string, boolean>();
   private opening: Promise<unknown> = Promise.resolve();
 
-  constructor(readonly limits: RuntimeLimits) {}
+  constructor(
+    readonly limits: RuntimeLimits,
+    private readonly hasLiveRuntime: (id: string) => boolean = () => false,
+  ) {}
 
   async open<T>(id: string, worker: boolean, operation: () => Promise<T>): Promise<T> {
     if (this.resident.has(id))
@@ -67,7 +70,8 @@ export class RuntimeAdmission {
     try {
       return await opening;
     } catch (error) {
-      if (!(error instanceof UnconfirmedRuntimeCloseError)) this.resident.delete(id);
+      if (!(error instanceof UnconfirmedRuntimeCloseError) && !this.hasLiveRuntime(id))
+        this.resident.delete(id);
       throw error;
     }
   }
