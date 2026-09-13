@@ -38,7 +38,7 @@ test("idle worker closes without archiving and resumes the same durable session"
       type: "assistant_message",
       text: "Completed evidence",
     });
-    await manager.closeIdleWorkers(Date.now() + 121_000);
+    await manager.closeIdleRuntimes(Date.now() + 121_000);
     expect(closed).toBe(1);
     expect(manager.getAgent(worker.id)).toBeNull();
     const stored = await storage.get(worker.id);
@@ -59,3 +59,56 @@ test("idle worker closes without archiving and resumes the same durable session"
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+test.each(
+  ["omp", "codex", "grok"].flatMap((provider) =>
+    ["root", "executive-assistant"].map((role) => ({ provider, role })),
+  ),
+)(
+  "idle $provider $role releases runtime and keeps readable history",
+  async ({ provider, role }) => {
+    const dir = await mkdtemp(join(tmpdir(), "paseo-idle-role-"));
+    const logger = createTestLogger();
+    const storage = new AgentStorage(join(dir, "agents"), logger);
+    await storage.initialize();
+    const manager = new AgentManager({
+      logger,
+      registry: storage,
+      historyDirectory: join(dir, "history"),
+      clients: { [provider]: createTestAgentClient(provider) },
+      runtimeLimits: { ...DEFAULT_RUNTIME_LIMITS, checkMemory: async () => {} },
+    });
+    try {
+      const agent = await manager.createAgent({ provider, cwd: dir }, undefined, {
+        labels: { role },
+      });
+      await manager.appendTimelineItem(agent.id, {
+        type: "assistant_message",
+        text: "Keep this history",
+      });
+      await manager.closeIdleRuntimes(Date.now() + 121_000);
+      expect(manager.getAgent(agent.id)).toBeNull();
+      expect((await storage.get(agent.id))?.archivedAt).toBeFalsy();
+      const history = await manager.readHistorySnapshot(agent.id);
+      expect(
+        history
+          ?.fetch(agent.id)
+          .rows.some(
+            (row) => row.item.type === "assistant_message" && row.item.text === "Keep this history",
+          ),
+      ).toBe(true);
+      expect(manager.getAgent(agent.id)).toBeNull();
+      const resumed = await ensureAgentLoaded(agent.id, {
+        agentManager: manager,
+        agentStorage: storage,
+        logger,
+      });
+      expect(resumed.persistence?.sessionId).toBe(agent.persistence?.sessionId);
+      await manager.closeAgent(agent.id);
+    } finally {
+      manager.prepareForShutdown();
+      await manager.flush();
+      await rm(dir, { recursive: true, force: true });
+    }
+  },
+);

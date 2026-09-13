@@ -1,3 +1,4 @@
+import { initializeAgentNotifications } from "./agent/agent-prompt.js";
 import { runtimeLimitsFromEnvironment } from "./agent/runtime/environment.js";
 import { describeHookWorkspace } from "./plugins/lifecycle/index.js";
 import express from "express";
@@ -921,6 +922,7 @@ export async function createPaseoDaemon(
   });
   const initialAgentManagerState = providerSnapshotManager.getAgentManagerProviderState();
   const agentManager = new AgentManager({
+    historyDirectory: path.join(config.paseoHome, "history-snapshots"),
     runtimeLimits: runtimeLimitsFromEnvironment(process.env),
     pluginLifecycle: pluginRuntime,
     clients: initialAgentManagerState.clients,
@@ -950,6 +952,12 @@ export async function createPaseoDaemon(
   );
   await agentStorage.initialize();
   logger.info({ elapsed: elapsed() }, "Agent storage initialized");
+  initializeAgentNotifications(
+    agentManager,
+    agentStorage,
+    logger,
+    process.env.PASEO_DISPATCH_QUEUE,
+  );
   await bootstrapWorkspaceRegistries({
     serverId,
     paseoHome: config.paseoHome,

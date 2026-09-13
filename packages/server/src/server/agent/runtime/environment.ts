@@ -18,9 +18,9 @@ export function runtimeLimitsFromEnvironment(env: NodeJS.ProcessEnv): RuntimeLim
   return {
     ...DEFAULT_RUNTIME_LIMITS,
     ompConfigPath,
-    async checkMemory() {
+    async checkMemory(continuation = false) {
       try {
-        await execute(command, [], {
+        await execute(command, continuation ? ["--continuation"] : [], {
           env: { ...env, PA_CAPACITY_MEMORY_ONLY: "1" },
           timeout: 12_000,
           maxBuffer: 16_384,

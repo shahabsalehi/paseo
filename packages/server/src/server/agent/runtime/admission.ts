@@ -23,8 +23,8 @@ export interface RuntimeLimits {
   maxExecuting: number;
   maxWorkers: number;
   idleMs: number;
-  maxWarmWorkers: number;
-  checkMemory: () => Promise<void>;
+  maxWarmRuntimes: number;
+  checkMemory: (continuation?: boolean) => Promise<void>;
   ompConfigPath?: string;
 }
 
@@ -34,7 +34,7 @@ export const DEFAULT_RUNTIME_LIMITS = {
   maxExecuting: 6,
   maxWorkers: 4,
   idleMs: 120_000,
-  maxWarmWorkers: 2,
+  maxWarmRuntimes: 2,
 };
 
 // Reservations are made before yielding. Opening providers is serialized so
@@ -47,9 +47,20 @@ export class RuntimeAdmission {
   constructor(
     readonly limits: RuntimeLimits,
     private readonly hasLiveRuntime: (id: string) => boolean = () => false,
+    private readonly reclaimIdle: () => Promise<void> = async () => {},
   ) {}
 
   async open<T>(id: string, worker: boolean, operation: () => Promise<T>): Promise<T> {
+    if (this.resident.has(id))
+      throw new RuntimeCapacityError("runtime already opening or resident");
+    if (
+      this.resident.size >= this.limits.maxResident ||
+      (worker &&
+        [...this.resident.values()].filter(Boolean).length >=
+          this.limits.maxResident - this.limits.coordinatorReserve)
+    )
+      await this.reclaimIdle();
+    // Re-check after asynchronous eviction: another caller may have reserved this ID.
     if (this.resident.has(id))
       throw new RuntimeCapacityError("runtime already opening or resident");
     const workers = [...this.resident.values()].filter(Boolean).length;
@@ -57,7 +68,9 @@ export class RuntimeAdmission {
       this.resident.size >= this.limits.maxResident ||
       (worker && workers >= this.limits.maxResident - this.limits.coordinatorReserve)
     ) {
-      throw new RuntimeCapacityError("resident runtime limit reached");
+      throw new RuntimeCapacityError(
+        `resident runtime limit reached (${this.resident.size} resident, ${this.executing.size} executing)`,
+      );
     }
     this.resident.set(id, worker);
     const opening = this.opening
@@ -72,6 +85,25 @@ export class RuntimeAdmission {
     } catch (error) {
       if (!(error instanceof UnconfirmedRuntimeCloseError) && !this.hasLiveRuntime(id))
         this.resident.delete(id);
+      throw error;
+    }
+  }
+
+  async startTurn<T>(id: string, worker: boolean, operation: () => Promise<T>): Promise<T> {
+    this.beginTurn(id, worker);
+    // Serialize checks AND startup with opens: the next sample observes the
+    // preceding operation. A resident runtime pays only continuation reserve.
+    const starting = this.opening
+      .catch(() => undefined)
+      .then(async () => {
+        await this.limits.checkMemory(true);
+        return operation();
+      });
+    this.opening = starting;
+    try {
+      return await starting;
+    } catch (error) {
+      this.endTurn(id);
       throw error;
     }
   }

@@ -112,6 +112,10 @@ export class AgentStorage {
     this.logger = logger.child({ module: "agent", component: "agent-storage" });
   }
 
+  getNotificationDirectory(): string {
+    return path.join(this.baseDir, "..", "notification-inbox");
+  }
+
   async initialize(): Promise<void> {
     await this.load();
   }

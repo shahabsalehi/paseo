@@ -1,3 +1,7 @@
+import { NotificationInbox } from "./notification-inbox.js";
+import { readdir, readFile } from "node:fs/promises";
+import { join } from "node:path";
+import { randomUUID } from "node:crypto";
 import type { Logger } from "pino";
 
 import type {
@@ -238,6 +242,7 @@ export interface SendPromptToAgentParams {
    * schedule fires, notify-on-finish).
    */
   unarchive?: boolean;
+  replaceRunning?: boolean;
   /** See {@link StartAgentRunOptions.clearPendingPermissions}. */
   clearPendingPermissions?: boolean;
   logger: Logger;
@@ -328,7 +333,7 @@ export async function sendPromptToAgent(
     : params.runOptions;
 
   return await startAgentRun(params.agentManager, params.agentId, params.prompt, params.logger, {
-    replaceRunning: true,
+    replaceRunning: params.replaceRunning ?? true,
     activeTurnBehavior: params.activeTurnBehavior,
     clearPendingPermissions: params.clearPendingPermissions,
     runOptions,
@@ -366,6 +371,96 @@ export async function startCreatedAgentInitialPrompt(
     throw new Error(`Agent ${params.agentId} not found`);
   }
   return refreshedSnapshot;
+}
+
+const notificationInboxes = new WeakMap<AgentManager, NotificationInbox>();
+
+export function initializeAgentNotifications(
+  agentManager: AgentManager,
+  agentStorage: AgentStorage,
+  logger: Logger,
+  promotedDirectory?: string,
+): NotificationInbox {
+  const existing = notificationInboxes.get(agentManager);
+  if (existing) return existing;
+  const inbox = new NotificationInbox(
+    agentStorage.getNotificationDirectory(),
+    async (id) => {
+      const record = await agentStorage.get(id);
+      const agent = agentManager.getAgent(id);
+      return Boolean(
+        record &&
+        !record.archivedAt &&
+        !agentManager.hasInFlightRun(id) &&
+        !agent?.pendingPermissions.size &&
+        (!agent || agent.lifecycle === "idle" || agent.lifecycle === "error"),
+      );
+    },
+    async (message) => {
+      await sendPromptToAgent({
+        agentManager,
+        agentStorage,
+        logger,
+        agentId: message.agentId,
+        prompt: message.prompt,
+        messageId: message.id,
+        replaceRunning: false,
+        unarchive: false,
+      });
+      await waitForAgentRunStartWithTimeout(agentManager, message.agentId);
+    },
+  );
+  notificationInboxes.set(agentManager, inbox);
+  let sweeping = false;
+  const sweep = async () => {
+    if (sweeping) return;
+    sweeping = true;
+    try {
+      if (promotedDirectory) {
+        const names = await readdir(promotedDirectory).catch((error: NodeJS.ErrnoException) => {
+          if (error.code === "ENOENT") return [];
+          throw error;
+        });
+        for (const name of names.filter((entry) => entry.endsWith(".json"))) {
+          const task = JSON.parse(await readFile(join(promotedDirectory, name), "utf8"));
+          // Old opaque entries require explicit ownership repair, never guessing.
+          if (
+            task.queue_version !== 1 ||
+            typeof task.task_id !== "string" ||
+            !/^[a-f0-9-]{36}$/.test(task.owner_agent_id ?? "")
+          )
+            continue;
+          await inbox.enqueue({
+            id: `queue:${task.task_id}`,
+            agentId: task.owner_agent_id,
+            prompt: formatSystemNotificationPrompt(
+              `Capacity queue promoted task ${task.task_id}. Read ${join(promotedDirectory, name)} and your task ledger. Resume its recorded agent_id if present; otherwise launch the approved worker once after a fresh capacity check. Record its ID with pa-queue.sh record, then consume only this task with pa-queue.sh consume. Promotion is not launch authorization beyond the original task contract.`,
+            ),
+          });
+        }
+      }
+      await inbox.drain();
+    } catch (error) {
+      logger.warn({ err: error }, "Notification inbox sweep deferred");
+    } finally {
+      sweeping = false;
+    }
+  };
+  const timer = setInterval(() => void sweep(), 30_000);
+  timer.unref();
+  const unsubscribe = agentManager.subscribe(
+    (event) => {
+      if (event.type === "agent_state" && event.agent.lifecycle === "idle") void sweep();
+    },
+    { replayState: false },
+  );
+  agentManager.onShutdown(() => {
+    clearInterval(timer);
+    unsubscribe();
+    void inbox.stop();
+  });
+  void sweep();
+  return inbox;
 }
 
 export interface SetupFinishNotificationParams {
@@ -431,8 +526,12 @@ export function setupFinishNotification(params: SetupFinishNotificationParams): 
     requireParentOwnership = false,
     logger,
   } = params;
+  const notificationId = randomUUID();
+  let notificationSequence = 0;
+  const inbox = initializeAgentNotifications(agentManager, agentStorage, logger);
   let hasSeenRunning = false;
   let stopped = false;
+  let terminalQueued = false;
   const notifiedPermissionRequestIds = new Set<string>();
   let unsubscribe: (() => void) | null = null;
   let notificationQueue = Promise.resolve();
@@ -466,23 +565,30 @@ export function setupFinishNotification(params: SetupFinishNotificationParams): 
       permissionRequest,
     });
 
-    await sendPromptToAgent({
-      agentManager,
-      agentStorage,
+    await inbox.enqueue({
+      id: `${notificationId}:${++notificationSequence}:${reason}:${permissionRequest?.id ?? "terminal"}`,
       agentId: callerAgentId,
       prompt: formatSystemNotificationPrompt(body),
-      activeTurnBehavior: "steer",
-      unarchive: false,
-      logger,
     });
+    void inbox
+      .drain()
+      .catch((error) => logger.warn({ err: error }, "Notification delivery deferred"));
   }
 
   function notifySafely(reason: FinishNotificationReason, options: NotifySafelyOptions = {}): void {
-    if (stopped) return;
-    if (options.terminal ?? true) stop();
+    if (stopped || terminalQueued) return;
+    const terminal = options.terminal ?? true;
+    if (terminal) terminalQueued = true;
     notificationQueue = notificationQueue
-      .then(() => notify(reason, options.permissionRequest))
+      .then(async () => {
+        await notify(reason, options.permissionRequest);
+        if (terminal) stop();
+        return undefined;
+      })
       .catch((error) => {
+        terminalQueued = false;
+        if (options.permissionRequest)
+          notifiedPermissionRequestIds.delete(options.permissionRequest.id);
         logger.error(
           { err: error, childAgentId, callerAgentId, reason },
           "Failed to notify caller agent",

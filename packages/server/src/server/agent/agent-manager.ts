@@ -1,3 +1,4 @@
+import { HistorySnapshots } from "./history-snapshot.js";
 import {
   RuntimeAdmission,
   UnconfirmedRuntimeCloseError,
@@ -296,6 +297,7 @@ export interface CreateAgentOptions {
 
 export interface AgentManagerOptions {
   runtimeLimits?: RuntimeLimits;
+  historyDirectory?: string;
   pluginLifecycle?: PluginLifecycle;
   clients?: ProviderClientMap;
   providerDefinitions?: ProviderEnabledMap;
@@ -705,6 +707,7 @@ export class AgentManager {
   private readonly providerEnabled = new Map<AgentProvider, boolean>();
   private readonly providerDefinitions = new Map<AgentProvider, ProviderEnabledFlag>();
   private readonly agents = new Map<string, LiveManagedAgent>();
+  private readonly historySnapshots?: HistorySnapshots;
   private readonly timelineStore = new InMemoryAgentTimelineStore();
   private readonly providerSubagents = new ProviderSubagentStore();
   private readonly agentsAwaitingInitialSnapshotPersist = new Set<string>();
@@ -739,15 +742,26 @@ export class AgentManager {
   private readonly rescueTimeouts: Required<AgentManagerRescueTimeouts>;
   private readonly beforeSteerUnavailableFallback?: AgentManagerOptions["beforeSteerUnavailableFallback"];
   private acceptingAgentRegistrations = true;
+  private readonly shutdownHooks: Array<() => void> = [];
+  onShutdown(hook: () => void): void {
+    this.shutdownHooks.push(hook);
+  }
 
   constructor(options: AgentManagerOptions) {
+    this.historySnapshots = options.historyDirectory
+      ? new HistorySnapshots(options.historyDirectory)
+      : undefined;
     this.runtimeAdmission = options.runtimeLimits
-      ? new RuntimeAdmission(options.runtimeLimits, (id) => this.agents.has(id))
+      ? new RuntimeAdmission(
+          options.runtimeLimits,
+          (id) => this.agents.has(id),
+          () => this.closeIdleRuntimes(Date.now(), true),
+        )
       : undefined;
     this.idleSweepTimer = this.startIdleSweep();
     this.pluginLifecycle = options.pluginLifecycle;
     this.idFactory = options.idFactory ?? (() => randomUUID());
-    this.registry = options?.registry;
+    this.registry = options.registry;
     this.durableTimelineStore = options?.durableTimelineStore;
     this.onAgentAttention = options?.onAgentAttention;
     this.onWorkspaceStateMayHaveChanged = options?.onWorkspaceStateMayHaveChanged;
@@ -781,7 +795,7 @@ export class AgentManager {
   private startIdleSweep(): ReturnType<typeof setInterval> | undefined {
     if (!this.runtimeAdmission) return undefined;
     const timer = setInterval(() => {
-      void this.closeIdleWorkers().catch((err) =>
+      void this.closeIdleRuntimes().catch((err) =>
         this.logger.warn({ err }, "Idle runtime cleanup failed"),
       );
     }, 30_000);
@@ -807,28 +821,29 @@ export class AgentManager {
     );
   }
 
-  async closeIdleWorkers(now = Date.now()): Promise<void> {
+  async closeIdleRuntimes(now = Date.now(), forAdmission = false): Promise<void> {
     if (!this.runtimeAdmission || !this.registry) return;
     const limits = this.runtimeAdmission.limits;
-    const candidates = [...this.agents.values()]
-      .filter((agent) => this.isWorker(agent.labels))
-      .filter(
-        (agent) =>
-          agent.persistence &&
-          !agent.internal &&
-          (agent.lifecycle === "idle" || agent.lifecycle === "error") &&
-          !agent.activeForegroundTurnId &&
-          !this.runs.hasRun(agent.id) &&
-          agent.pendingPermissions.size === 0 &&
-          !this.providerSubagents.list(agent.id).some((child) => child.status === "running"),
-      );
+    const candidates = [...this.agents.values()].filter(
+      (agent) =>
+        agent.persistence &&
+        !agent.internal &&
+        (agent.lifecycle === "idle" || agent.lifecycle === "error") &&
+        !agent.activeForegroundTurnId &&
+        !this.runs.hasRun(agent.id) &&
+        agent.pendingPermissions.size === 0 &&
+        !this.providerSubagents.list(agent.id).some((child) => child.status === "running"),
+    );
     candidates.sort(
       (a, b) => (this.idleSince.get(a.id) ?? now) - (this.idleSince.get(b.id) ?? now),
     );
     for (const [index, candidate] of candidates.entries()) {
       const observedIdleSince = this.idleSince.get(candidate.id);
       const expired = now - (observedIdleSince ?? now) >= limits.idleMs;
-      if (!expired && index >= candidates.length - limits.maxWarmWorkers) continue;
+      // Newly registered runtimes need time to receive their initial prompt.
+      if (!expired && now - (observedIdleSince ?? now) < 5_000) continue;
+      if (!forAdmission && !expired && index >= candidates.length - limits.maxWarmRuntimes)
+        continue;
       await this.runLifecycleMutation(candidate.id, async () => {
         const current = this.agents.get(candidate.id);
         if (
@@ -842,6 +857,14 @@ export class AgentManager {
           return;
         if (this.idleSince.get(current.id) !== observedIdleSince) return;
         if (this.providerSubagents.list(current.id).some((child) => child.status === "running"))
+          return;
+        if (
+          [...this.agents.values()].some(
+            (child) =>
+              child.labels[PARENT_AGENT_ID_LABEL] === current.id &&
+              (this.runs.hasRun(child.id) || child.pendingPermissions.size > 0),
+          )
+        )
           return;
         await this.closeAgentRuntime(current.id);
       });
@@ -910,6 +933,7 @@ export class AgentManager {
   prepareForShutdown(): void {
     this.acceptingAgentRegistrations = false;
     clearInterval(this.idleSweepTimer);
+    for (const hook of this.shutdownHooks) hook();
   }
 
   setPaseoToolsEnabled(enabled: boolean): void {
@@ -1236,6 +1260,17 @@ export class AgentManager {
     return this.timelineStore.getItems(id);
   }
 
+  async saveHistorySnapshot(id: string): Promise<void> {
+    const agent = this.agents.get(id);
+    // Never overwrite a complete projection with a newly resumed, unhydrated one.
+    if (agent?.historyPrimed && this.timelineStore.has(id))
+      await this.historySnapshots?.save(id, this.timelineStore.fetch(id, { limit: 0 }));
+  }
+
+  async readHistorySnapshot(id: string): Promise<InMemoryAgentTimelineStore | null> {
+    return (await this.historySnapshots?.read(id)) ?? null;
+  }
+
   async getTimelineRows(id: string): Promise<AgentTimelineRow[]> {
     this.requireAgent(id);
     if (this.durableTimelineStore) {
@@ -1282,7 +1317,7 @@ export class AgentManager {
     return this.providerSubagents.fetchTimeline(parentAgentId, subagentId, options);
   }
 
-  createAgent(
+  async createAgent(
     config: AgentSessionConfig,
     agentId: string | undefined,
     options: CreateAgentOptions,
@@ -1358,7 +1393,7 @@ export class AgentManager {
 
   // Reconstruct an agent from provider persistence. Callers should explicitly
   // hydrate timeline history after resume.
-  resumeAgentFromPersistence(
+  async resumeAgentFromPersistence(
     handle: AgentPersistenceHandle,
     overrides?: Partial<AgentSessionConfig>,
     agentId?: string,
@@ -1758,6 +1793,7 @@ export class AgentManager {
       "agent.manager.close.start",
     );
     await this.drainSessionEvents(agentId);
+    await this.saveHistorySnapshot(agentId);
     this.cancelRunningProviderSubagents(agentId);
     const closedAgent = this.prepareAgentForClosure(agent, "agent closed");
     let closeError: unknown;
@@ -2477,10 +2513,14 @@ export class AgentManager {
     const { agent, agentId, pendingRun, prompt, options } = params;
     try {
       const worker = this.isWorker(agent.labels);
-      this.runtimeAdmission?.beginTurn(agentId, worker);
-      if (worker) await this.runtimeAdmission?.limits.checkMemory();
       if (pendingRun.settled) throw new Error(`Agent ${agentId} run canceled before admission`);
-      const result = await agent.session.startTurn(prompt, options);
+      const start = () => {
+        if (pendingRun.settled) throw new Error(`Agent ${agentId} run canceled before admission`);
+        return agent.session.startTurn(prompt, options);
+      };
+      const result = this.runtimeAdmission
+        ? await this.runtimeAdmission.startTurn(agentId, worker, start)
+        : await start();
       if (pendingRun.settled) {
         throw new Error(`Agent ${agentId} run was canceled before its turn started`);
       }
@@ -3180,6 +3220,7 @@ export class AgentManager {
   ): Promise<void> {
     const agent = this.requireSessionAgent(agentId);
     await this.hydrateTimelineFromLegacyProviderHistory(agent, options);
+    await this.saveHistorySnapshot(agentId);
   }
 
   async rewind(agentId: string, messageId: string, mode: RewindMode): Promise<void> {

@@ -1,4 +1,4 @@
-import { expect, it, test, vi } from "vitest";
+import { afterEach, expect, it, test, vi } from "vitest";
 import pino, { type Logger } from "pino";
 import { randomUUID } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
@@ -21,6 +21,11 @@ import type {
   AgentSession,
   AgentStreamEvent,
 } from "./agent-sdk-types.js";
+
+const cleanups: Array<() => void> = [];
+afterEach(() => {
+  for (const cleanup of cleanups.splice(0)) cleanup();
+});
 
 interface CapturedLogger {
   logger: Logger;
@@ -87,6 +92,7 @@ function createFinishNotificationScenario(
   Reflect.set(callerAgent, "id", "caller-agent");
   Reflect.set(callerAgent, "lifecycle", "idle");
   Reflect.set(callerAgent, "config", { title: "Caller Agent" });
+  Reflect.set(callerAgent, "pendingPermissions", new Map());
 
   const agentManager = new AgentManager({ clients: {}, logger: createTestLogger() });
   Reflect.set(agentManager, "getAgent", (agentId: string) => {
@@ -107,6 +113,7 @@ function createFinishNotificationScenario(
   Reflect.set(agentManager, "getLastAssistantMessage", async () => {
     return options?.childLastAssistantMessage ?? null;
   });
+  Reflect.set(agentManager, "waitForAgentRunStart", async () => {});
   Reflect.set(agentManager, "tryRunOutOfBand", () => false);
   Reflect.set(agentManager, "hasInFlightRun", () => Boolean(options?.parentPromptError));
   Reflect.set(agentManager, "steerOrReplaceActiveTurn", async () => {
@@ -124,7 +131,12 @@ function createFinishNotificationScenario(
     throw options?.parentPromptError;
   });
 
-  const agentStorage: AgentStorage = Object.create(AgentStorage.prototype);
+  const inboxDir = mkdtempSync(join(tmpdir(), "paseo-notify-test-"));
+  const agentStorage = new AgentStorage(join(inboxDir, "agents"), createTestLogger());
+  cleanups.push(() => {
+    agentManager.prepareForShutdown();
+    rmSync(inboxDir, { recursive: true, force: true });
+  });
   Reflect.set(agentStorage, "get", async (agentId: string) => {
     if (agentId === "child-agent") {
       const parentAgentId =
@@ -134,7 +146,7 @@ function createFinishNotificationScenario(
         labels: parentAgentId ? { "paseo.parent-agent-id": parentAgentId } : {},
       };
     }
-    return null;
+    return agentId === "caller-agent" ? { id: agentId } : null;
   });
 
   return {
@@ -277,7 +289,7 @@ test("finish notifications tell the parent the child's last assistant message", 
       "Agent child-agent (Child Agent) finished.\n\n<agent-response>\nImplemented the cleanup and all checks pass.\n</agent-response>",
     ),
   );
-  expect(scenario.steerAttemptCount()).toBe(1);
+  expect(scenario.steerAttemptCount()).toBe(0);
 });
 
 test("finish notifications truncate oversized child responses", async () => {
@@ -429,26 +441,18 @@ test("follow-up finish notifications do not require a parent relationship", asyn
   expect(parentPrompt).toContain("Agent child-agent (Child Agent) finished.");
 });
 
-test("finish notifications log a rejected parent prompt without an unhandled rejection", async () => {
+test("finish notifications wait for a busy parent without attempting replacement", async () => {
   const captured = createCapturedLogger();
   const scenario = createFinishNotificationScenario({
-    parentPromptError: new Error("parent provider rejected replacement"),
+    parentPromptError: new Error("busy parent"),
     logger: captured.logger,
   });
-
   scenario.startWatchingChild();
-  await scenario.finishChildAndReadParentPrompt();
-  await captured.nextRecord;
-
-  expect(captured.records).toEqual([
-    expect.objectContaining({
-      msg: "Failed to notify caller agent",
-      childAgentId: "child-agent",
-      callerAgentId: "caller-agent",
-      reason: "finished",
-      err: expect.objectContaining({ message: "parent provider rejected replacement" }),
-    }),
-  ]);
+  scenario.finishChild();
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  expect(scenario.wasParentPrompted()).toBe(false);
+  expect(scenario.steerAttemptCount()).toBe(0);
+  expect(captured.records).toEqual([]);
 });
 
 it("does not notify archived callers", async () => {
@@ -464,6 +468,7 @@ it("does not notify archived callers", async () => {
   Reflect.set(callerAgent, "id", "caller-agent");
   Reflect.set(callerAgent, "lifecycle", "idle");
   Reflect.set(callerAgent, "config", { title: "Caller Agent" });
+  Reflect.set(callerAgent, "pendingPermissions", new Map());
 
   const streamAgentSpy = vi.fn(() => (async function* noop() {})());
   const replaceAgentRunSpy = vi.fn(() => (async function* noop() {})());
@@ -499,7 +504,12 @@ it("does not notify archived callers", async () => {
   const agentStorageGetSpy = vi.fn(async (agentId: string) =>
     agentId === "caller-agent" ? { archivedAt: "2024-01-01" } : null,
   );
-  const agentStorage: AgentStorage = Object.create(AgentStorage.prototype);
+  const inboxDir = mkdtempSync(join(tmpdir(), "paseo-notify-test-"));
+  const agentStorage = new AgentStorage(join(inboxDir, "agents"), createTestLogger());
+  cleanups.push(() => {
+    agentManager.prepareForShutdown();
+    rmSync(inboxDir, { recursive: true, force: true });
+  });
   Reflect.set(agentStorage, "get", agentStorageGetSpy);
 
   setupFinishNotification({
