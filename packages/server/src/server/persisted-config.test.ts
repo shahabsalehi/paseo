@@ -612,6 +612,23 @@ describe("PersistedConfigSchema logging config", () => {
 });
 
 describe("PersistedConfigSchema voice mode config", () => {
+  test("accepts explicit voice response modes", () => {
+    const automatic = PersistedConfigSchema.parse({
+      features: { voiceMode: { responseMode: "autoSpeakFinal" } },
+    });
+    const toolDirected = PersistedConfigSchema.parse({
+      features: { voiceMode: { responseMode: "toolDirected" } },
+    });
+
+    expect(automatic.features?.voiceMode?.responseMode).toBe("autoSpeakFinal");
+    expect(toolDirected.features?.voiceMode?.responseMode).toBe("toolDirected");
+    expect(
+      PersistedConfigSchema.safeParse({
+        features: { voiceMode: { responseMode: "fallback" } },
+      }).success,
+    ).toBe(false);
+  });
+
   test("accepts a dedicated turn detection provider", () => {
     const parsed = PersistedConfigSchema.parse({
       features: {

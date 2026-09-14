@@ -1,6 +1,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { z } from "zod";
+import { VoiceResponseModeSchema } from "./voice-config.js";
 
 import {
   AgentProviderRuntimeSettingsMapSchema,
@@ -116,6 +117,7 @@ const FeatureDictationSchema = z
 const FeatureVoiceModeSchema = z
   .object({
     enabled: z.boolean().optional(),
+    responseMode: VoiceResponseModeSchema.optional(),
     llm: z
       .object({
         provider: z.string().optional(),

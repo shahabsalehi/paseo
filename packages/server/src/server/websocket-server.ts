@@ -54,6 +54,7 @@ import type { ServiceProxySubsystem } from "./service-proxy.js";
 import type { WorkspaceScriptRuntimeStore } from "./workspace-script-runtime-store.js";
 import type { SpeechReadinessSnapshot, SpeechService } from "./speech/speech-runtime.js";
 import type { VoiceCallerContext, VoiceSpeakHandler } from "./voice-types.js";
+import type { VoiceResponseMode } from "./voice-config.js";
 import {
   computeNotificationPlan,
   isPushEligibleAttentionReason,
@@ -134,6 +135,7 @@ interface WebSocketServerConfig {
   hostnames?: HostnamesConfig;
   daemonStatusRpc?: boolean;
   relayConfig?: boolean;
+  voiceResponseMode?: VoiceResponseMode;
 }
 
 type WebSocketRuntimeMetrics = SessionRuntimeMetrics & CheckoutDiffMetrics;
@@ -566,6 +568,7 @@ export class VoiceAssistantWebSocketServer {
   private acceptingConnections = true;
   private readonly advertiseDaemonStatusRpc: boolean;
   private readonly advertiseRelayConfig: boolean;
+  private readonly voiceResponseMode: VoiceResponseMode | undefined;
 
   constructor(
     server: HTTPServer,
@@ -614,6 +617,7 @@ export class VoiceAssistantWebSocketServer {
     workspaceSetupRuntime: WorkspaceSetupRuntime = new WorkspaceSetupRuntime(),
   ) {
     this.logger = logger.child({ module: "websocket-server" });
+    this.voiceResponseMode = wsConfig.voiceResponseMode;
     this.workspaceSetupRuntime = workspaceSetupRuntime;
     this.advertiseDaemonStatusRpc = wsConfig.daemonStatusRpc !== false;
     this.advertiseRelayConfig = wsConfig.relayConfig !== false;
@@ -1365,6 +1369,7 @@ export class VoiceAssistantWebSocketServer {
       resolveScriptHealth: this.resolveScriptHealth ?? undefined,
       voice: {
         turnDetection: () => this.speech?.resolveTurnDetection() ?? null,
+        responseMode: this.voiceResponseMode,
       },
       voiceBridge: {
         registerVoiceSpeakHandler: (agentId, handler) => {

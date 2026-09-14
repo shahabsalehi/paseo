@@ -223,7 +223,7 @@ Single file, validated with `PersistedConfigSchema`.
   },
   features: {
     dictation: { enabled, stt: { provider, model, language, confidenceThreshold } },
-    voiceMode: { enabled, llm, stt: { provider, model, language }, turnDetection, tts: { provider, model, voice, speakerId, speed } }
+    voiceMode: { enabled, responseMode, llm, stt: { provider, model, language }, turnDetection, tts: { provider, model, voice, speakerId, speed } }
   },
   log: {
     level, format,
@@ -272,6 +272,11 @@ For a desktop-managed daemon, fully quit and reopen Paseo Desktop.
 `agents.metadataGeneration.providers` controls the preferred structured-generation fallback order for daemon-side metadata tasks such as commit messages, PR text, branch names, and generated agent titles. Entries are tried first in the configured order, then Paseo falls through to dynamically discovered defaults and finally the current selection when available.
 
 Local speech model ids are intentionally narrow: STT uses `parakeet-tdt-0.6b-v2-int8`, TTS uses `kokoro-en-v0_19`, and turn detection uses the bundled Silero VAD model.
+
+`features.voiceMode.responseMode` controls how a voice turn becomes speech. `toolDirected` is the
+default and asks the runtime to call Paseo’s `speak` tool. `autoSpeakFinal` leaves the runtime’s
+normal final response in the timeline and sends the last assistant message to TTS after the turn
+completes. Set `PASEO_VOICE_RESPONSE_MODE` to override the persisted value.
 
 Set these to select OpenAI instead of local speech:
 

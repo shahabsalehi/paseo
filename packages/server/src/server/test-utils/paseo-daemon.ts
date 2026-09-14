@@ -39,6 +39,7 @@ interface TestPaseoDaemonOptions {
   voiceLlmProvider?: PaseoDaemonConfig["voiceLlmProvider"];
   voiceLlmProviderExplicit?: boolean;
   voiceLlmModel?: string | null;
+  voiceResponseMode?: PaseoDaemonConfig["voiceResponseMode"];
   dictationFinalTimeoutMs?: number;
   auth?: PaseoDaemonConfig["auth"];
   pushNotificationSender?: PushNotificationSender;
@@ -192,6 +193,7 @@ async function prepareTestDaemonConfig(
     voiceLlmProvider: options.voiceLlmProvider ?? null,
     voiceLlmProviderExplicit: options.voiceLlmProviderExplicit ?? false,
     voiceLlmModel: options.voiceLlmModel ?? null,
+    voiceResponseMode: options.voiceResponseMode,
     dictationFinalTimeoutMs: options.dictationFinalTimeoutMs,
     downloadTokenTtlMs: options.downloadTokenTtlMs,
   };

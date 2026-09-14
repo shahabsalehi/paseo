@@ -23,6 +23,11 @@ import { hashDaemonPassword } from "./auth.js";
 import { resolveSpeechConfig } from "./speech/speech-config-resolver.js";
 import { mergeHostnames, parseHostnamesEnv, type HostnamesConfig } from "./hostnames.js";
 import { resolveGitProcessPolicy } from "../utils/git-process-scheduler.js";
+import {
+  DEFAULT_VOICE_RESPONSE_MODE,
+  VoiceResponseModeSchema,
+  type VoiceResponseMode,
+} from "./voice-config.js";
 
 const DEFAULT_PORT = 6767;
 const DEFAULT_RELAY_ENDPOINT = "relay.paseo.sh:443";
@@ -325,6 +330,20 @@ function resolveWebUiConfig(
   };
 }
 
+export function resolveVoiceResponseMode(
+  envValue: string | undefined,
+  persistedValue: VoiceResponseMode | undefined,
+): VoiceResponseMode {
+  const rawValue = envValue ?? persistedValue ?? DEFAULT_VOICE_RESPONSE_MODE;
+  const parsed = VoiceResponseModeSchema.safeParse(rawValue);
+  if (!parsed.success) {
+    throw new Error(
+      `Invalid PASEO_VOICE_RESPONSE_MODE: ${rawValue}. Expected toolDirected or autoSpeakFinal.`,
+    );
+  }
+  return parsed.data;
+}
+
 function resolveVoiceLlmConfig(
   env: NodeJS.ProcessEnv,
   persisted: ReturnType<typeof loadPersistedConfig>,
@@ -500,6 +519,10 @@ export function loadConfig(
   });
 
   const voiceLlm = resolveVoiceLlmConfig(env, persisted);
+  const voiceResponseMode = resolveVoiceResponseMode(
+    env.PASEO_VOICE_RESPONSE_MODE,
+    persisted.features?.voiceMode?.responseMode,
+  );
   const providerOverrides = extractProviderOverrides(
     persisted.agents?.providers as Record<string, unknown> | undefined,
   );
@@ -540,6 +563,7 @@ export function loadConfig(
     voiceLlmProvider: voiceLlm.provider,
     voiceLlmProviderExplicit: voiceLlm.providerExplicit,
     voiceLlmModel: voiceLlm.model,
+    voiceResponseMode,
     agentProviderSettings: extractAgentProviderSettings(providerOverrides),
     metadataGeneration: persisted.agents?.metadataGeneration,
     providerOverrides,

@@ -1,5 +1,11 @@
+import { z } from "zod";
+
 const VOICE_PROMPT_BLOCK_START = "<paseo_voice_mode>";
 const VOICE_PROMPT_BLOCK_END = "</paseo_voice_mode>";
+
+export const VoiceResponseModeSchema = z.enum(["toolDirected", "autoSpeakFinal"]);
+export type VoiceResponseMode = z.infer<typeof VoiceResponseModeSchema>;
+export const DEFAULT_VOICE_RESPONSE_MODE: VoiceResponseMode = "toolDirected";
 
 const VOICE_AGENT_SYSTEM_INSTRUCTION = [
   "Paseo voice mode is now on.",
@@ -53,8 +59,20 @@ export function buildVoiceModeSystemPrompt(existing: string | undefined, enabled
     .join("\n\n");
 }
 
-export function wrapSpokenInput(text: string): string {
-  return `<spoken-input>\n${text}\n</spoken-input>\n<instruction>This message was spoken by the user. Respond using the speak tool only, not normal messages, because the user may not be looking at the chat.</instruction>`;
+export function wrapSpokenInput(
+  text: string,
+  responseMode: VoiceResponseMode = DEFAULT_VOICE_RESPONSE_MODE,
+): string {
+  const instruction =
+    responseMode === "autoSpeakFinal"
+      ? "This message was spoken by the user. After completing the requested work, respond with one concise normal assistant message suitable for speech. Do not call the speak tool; Paseo will speak the final response automatically. If the transcription is incomplete or ambiguous, ask one concise clarifying question."
+      : "This message was spoken by the user. Respond using the speak tool only, not normal messages, because the user may not be looking at the chat.";
+  return [
+    "<spoken-input>",
+    text,
+    "</spoken-input>",
+    `<instruction>${instruction}</instruction>`,
+  ].join("\n");
 }
 
 export function buildVoiceAgentMcpServerConfig(params: {

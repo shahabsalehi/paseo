@@ -142,7 +142,7 @@ import {
   type WorkspaceMutation,
   type WorkspaceRegistry,
 } from "./workspace-registry.js";
-import { wrapSpokenInput } from "./voice-config.js";
+import { wrapSpokenInput, type VoiceResponseMode } from "./voice-config.js";
 import { isVoicePermissionAllowed } from "./voice-permission-policy.js";
 import {
   readProjectIcon,
@@ -486,6 +486,7 @@ export interface SessionOptions {
   resolveScriptHealth?: (hostname: string) => ScriptHealthState | null;
   voice?: {
     turnDetection?: Resolvable<TurnDetectionProvider | null>;
+    responseMode?: VoiceResponseMode;
   };
   voiceBridge?: {
     registerVoiceSpeakHandler?: (agentId: string, handler: VoiceSpeakHandler) => void;
@@ -1018,16 +1019,17 @@ export class Session {
           }),
         reloadAgentSession: (agentId, overrides) =>
           this.agentManager.reloadAgentSession(agentId, overrides),
-        sendSpokenInput: async (agentId, text) => {
-          await this.handleSendAgentMessage(
+        sendSpokenInput: async (agentId, text, responseMode, clientMessageId) => {
+          const result = await this.handleSendAgentMessage(
             agentId,
             text,
+            clientMessageId,
             undefined,
             undefined,
             undefined,
-            undefined,
-            { spokenInput: true },
+            { spokenInput: true, voiceResponseMode: responseMode },
           );
+          return result.ok && !result.outOfBand;
         },
         interruptAgentIfRunning: (agentId) => this.interruptAgentIfRunning(agentId),
         hasActiveAgentRun: (agentId) => this.hasActiveAgentRun(agentId),
@@ -1607,6 +1609,8 @@ export class Session {
           }
           return;
         }
+
+        this.voiceSession.handleAgentStreamEvent(event.agentId, event.event);
 
         if (
           this.voiceSession.isActiveForAgent(event.agentId) &&
@@ -3082,8 +3086,8 @@ export class Session {
     images?: Array<{ data: string; mimeType: string }>,
     attachments?: AgentAttachment[],
     runOptions?: AgentRunOptions,
-    options?: { spokenInput?: boolean },
-  ): Promise<{ ok: true } | { ok: false; error: string }> {
+    options?: { spokenInput?: boolean; voiceResponseMode?: VoiceResponseMode },
+  ): Promise<{ ok: true; outOfBand: boolean } | { ok: false; error: string }> {
     this.sessionLogger.info(
       {
         agentId,
@@ -3100,11 +3104,13 @@ export class Session {
       }`,
     );
 
-    const promptText = options?.spokenInput ? wrapSpokenInput(text) : text;
+    const promptText = options?.spokenInput
+      ? wrapSpokenInput(text, options.voiceResponseMode)
+      : text;
     const prompt = buildAgentPrompt(promptText, images, attachments);
 
     try {
-      await sendPromptToAgent({
+      const dispatchResult = await sendPromptToAgent({
         agentManager: this.agentManager,
         agentStorage: this.agentStorage,
         agentId,
@@ -3113,7 +3119,7 @@ export class Session {
         runOptions,
         logger: this.sessionLogger,
       });
-      return { ok: true };
+      return { ok: true, outOfBand: dispatchResult.outOfBand };
     } catch (error) {
       this.handleAgentRunError(agentId, error, "Failed to send agent message");
       return {

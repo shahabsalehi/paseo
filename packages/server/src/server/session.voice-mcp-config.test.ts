@@ -4,6 +4,7 @@ import {
   buildVoiceAgentMcpServerConfig,
   buildVoiceModeSystemPrompt,
   stripVoiceModeSystemPrompt,
+  wrapSpokenInput,
 } from "./voice-config.js";
 
 describe("voice MCP stdio config", () => {
@@ -41,6 +42,15 @@ describe("voice mode prompt instructions", () => {
     expect(prompt).toContain("Paseo voice mode is now on.");
     expect(prompt).toContain("Always use the speak tool for all user-facing communication.");
     expect(prompt).toContain("</paseo_voice_mode>");
+  });
+
+  test("wraps automatic-final spoken input without directing the runtime to call speak", () => {
+    const spokenInput = wrapSpokenInput("What changed?", "autoSpeakFinal");
+
+    expect(spokenInput).toContain("one concise normal assistant message suitable for speech");
+    expect(spokenInput).toContain("Do not call the speak tool");
+    expect(spokenInput).toContain("Paseo will speak the final response automatically");
+    expect(spokenInput).toContain("ask one concise clarifying question");
   });
 
   test("builds disabled voice instructions and supersedes previous voice block", () => {

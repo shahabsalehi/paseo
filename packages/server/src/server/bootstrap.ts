@@ -218,6 +218,7 @@ import {
   type HubRelationshipRemote,
 } from "./hub/relationship-remote.js";
 import { DaemonExecutions } from "./hub/daemon-executions.js";
+import type { VoiceResponseMode } from "./voice-config.js";
 
 const MAX_MCP_DEBUG_BATCH_ITEMS = 10;
 const REDACTED_LOG_VALUE = "[redacted]";
@@ -425,6 +426,7 @@ export interface PaseoDaemonConfig {
   voiceLlmProvider?: AgentProvider | null;
   voiceLlmProviderExplicit?: boolean;
   voiceLlmModel?: string | null;
+  voiceResponseMode?: VoiceResponseMode;
   dictationFinalTimeoutMs?: number;
   downloadTokenTtlMs?: number;
   agentProviderSettings?: AgentProviderRuntimeSettingsMap;
@@ -1520,6 +1522,7 @@ export async function createPaseoDaemon(
                 hostnames: configuredHostnames,
                 daemonStatusRpc: dependencies.serverFeatureOverrides?.daemonStatusRpc,
                 relayConfig: dependencies.serverFeatureOverrides?.relayConfig,
+                voiceResponseMode: config.voiceResponseMode,
               },
               workspaceAutoName,
               config.auth,

@@ -14,10 +14,21 @@ import {
   type DictationStreamOutboundMessage,
 } from "../../dictation/dictation-stream-manager.js";
 import { createVoiceTurnController, type VoiceTurnController } from "./voice-turn-controller.js";
-import { buildVoiceModeSystemPrompt, stripVoiceModeSystemPrompt } from "../../voice-config.js";
+import {
+  beginAutomaticFinalSpeechTurn,
+  clearAutomaticFinalSpeechTurn,
+  reduceAutomaticFinalSpeechEvent,
+  type AutomaticFinalSpeechState,
+} from "./automatic-final-speech.js";
+import {
+  buildVoiceModeSystemPrompt,
+  DEFAULT_VOICE_RESPONSE_MODE,
+  stripVoiceModeSystemPrompt,
+  type VoiceResponseMode,
+} from "../../voice-config.js";
 import type { VoiceCallerContext, VoiceSpeakHandler } from "../../voice-types.js";
 import type { ManagedAgent } from "../../agent/agent-manager.js";
-import type { AgentSessionConfig } from "../../agent/agent-sdk-types.js";
+import type { AgentSessionConfig, AgentStreamEvent } from "../../agent/agent-sdk-types.js";
 import type { LocalSpeechModelId } from "../../speech/providers/local/models.js";
 import { toResolver, type Resolvable } from "../../speech/provider-resolver.js";
 import type { SpeechReadinessSnapshot, SpeechReadinessState } from "../../speech/speech-runtime.js";
@@ -126,7 +137,12 @@ export interface VoiceSessionHost {
     agentId: string,
     overrides: Partial<AgentSessionConfig>,
   ): Promise<ManagedAgent>;
-  sendSpokenInput(agentId: string, text: string): Promise<void>;
+  sendSpokenInput(
+    agentId: string,
+    text: string,
+    responseMode: VoiceResponseMode,
+    clientMessageId?: string,
+  ): Promise<boolean>;
   interruptAgentIfRunning(agentId: string): Promise<void>;
   hasActiveAgentRun(agentId: string | null): boolean;
 }
@@ -140,6 +156,7 @@ export interface VoiceSessionOptions {
   stt: Resolvable<SpeechToTextProvider | null>;
   voice?: {
     turnDetection?: Resolvable<TurnDetectionProvider | null>;
+    responseMode?: VoiceResponseMode;
   };
   voiceBridge?: {
     registerVoiceSpeakHandler?: (agentId: string, handler: VoiceSpeakHandler) => void;
@@ -167,6 +184,7 @@ export class VoiceSession {
   private readonly sessionLogger: pino.Logger;
   private readonly sessionId: string;
   private readonly sttLanguage: string;
+  private readonly responseMode: VoiceResponseMode;
 
   private abortController: AbortController;
   private processingPhase: ProcessingPhase = "idle";
@@ -206,6 +224,7 @@ export class VoiceSession {
 
   private voiceModeAgentId: string | null = null;
   private voiceModeBaseConfig: VoiceModeBaseConfig | null = null;
+  private automaticFinalSpeechState: AutomaticFinalSpeechState = clearAutomaticFinalSpeechTurn();
 
   constructor(options: VoiceSessionOptions) {
     const { host, logger, sessionId, sttLanguage, tts, stt, voice, voiceBridge, dictation } =
@@ -214,6 +233,7 @@ export class VoiceSession {
     this.sessionLogger = logger;
     this.sessionId = sessionId;
     this.sttLanguage = sttLanguage ?? "en";
+    this.responseMode = voice?.responseMode ?? DEFAULT_VOICE_RESPONSE_MODE;
     this.abortController = new AbortController();
 
     this.resolveVoiceTurnDetection = toResolver(voice?.turnDetection ?? null);
@@ -239,6 +259,73 @@ export class VoiceSession {
 
   isActiveForAgent(agentId: string): boolean {
     return this.isVoiceMode && this.voiceModeAgentId === agentId;
+  }
+
+  handleAgentStreamEvent(agentId: string, event: AgentStreamEvent): void {
+    if (this.responseMode !== "autoSpeakFinal" || !this.isActiveForAgent(agentId)) {
+      return;
+    }
+
+    const transition = reduceAutomaticFinalSpeechEvent(this.automaticFinalSpeechState, event);
+    this.automaticFinalSpeechState = transition.state;
+    if (!transition.response) {
+      return;
+    }
+
+    void this.speakAutomaticFinalResponse({
+      agentId,
+      turnId: transition.response.turnId,
+      speechText: transition.response.text,
+      abortSignal: this.abortController.signal,
+    });
+  }
+
+  private async speakAutomaticFinalResponse(params: {
+    agentId: string;
+    turnId: string | undefined;
+    speechText: string;
+    abortSignal: AbortSignal;
+  }): Promise<void> {
+    const { agentId, turnId, speechText, abortSignal } = params;
+    const dispatchStartedAt = Date.now();
+    this.sessionLogger.info(
+      { agentId, turnId, textLength: speechText.length },
+      "Automatic final-response speech dispatch started",
+    );
+    try {
+      await this.ttsManager.generateAndWaitForPlayback(
+        speechText,
+        (message) => this.emit(message),
+        abortSignal,
+        true,
+      );
+      this.sessionLogger.info(
+        { agentId, turnId, elapsedMs: Date.now() - dispatchStartedAt },
+        "Automatic final-response speech playback finished",
+      );
+    } catch (error) {
+      if (abortSignal.aborted) {
+        this.sessionLogger.debug(
+          { agentId, turnId, elapsedMs: Date.now() - dispatchStartedAt },
+          "Automatic final-response speech canceled",
+        );
+        return;
+      }
+      this.sessionLogger.warn(
+        { err: error, agentId, turnId, elapsedMs: Date.now() - dispatchStartedAt },
+        "Automatic final-response speech failed",
+      );
+      this.emit({
+        type: "activity_log",
+        payload: {
+          id: uuidv4(),
+          timestamp: new Date(),
+          type: "error",
+          content: "Voice playback failed. Read the response above or try again.",
+          metadata: { voiceTtsFailed: true, ...(turnId !== undefined ? { turnId } : {}) },
+        },
+      });
+    }
   }
 
   handleDictationChunk(params: {
@@ -478,6 +565,15 @@ export class VoiceSession {
       "enableVoiceModeForAgent.ensureAgentLoaded.done",
     );
 
+    if (this.responseMode === "autoSpeakFinal") {
+      this.voiceModeBaseConfig = null;
+      this.sessionLogger.info(
+        { agentId, elapsedMs: Date.now() - startedAt },
+        "enableVoiceModeForAgent automatic-final mode enabled without runtime reload",
+      );
+      return existing.id;
+    }
+
     this.registerVoiceBridgeForAgent(agentId);
 
     const baseConfig: VoiceModeBaseConfig = {
@@ -509,6 +605,11 @@ export class VoiceSession {
 
   private async disableVoiceModeForActiveAgent(restoreAgentConfig: boolean): Promise<void> {
     await this.stopVoiceTurnController();
+    this.automaticFinalSpeechState = clearAutomaticFinalSpeechTurn();
+    if (this.responseMode === "autoSpeakFinal") {
+      this.abortController.abort();
+      this.ttsManager.cancelPendingPlaybacks("voice mode disabled");
+    }
 
     const agentId = this.voiceModeAgentId;
     if (!agentId) {
@@ -516,8 +617,10 @@ export class VoiceSession {
       return;
     }
 
-    this.unregisterVoiceSpeakHandler?.(agentId);
-    this.unregisterVoiceCallerContext?.(agentId);
+    if (this.responseMode === "toolDirected") {
+      this.unregisterVoiceSpeakHandler?.(agentId);
+      this.unregisterVoiceCallerContext?.(agentId);
+    }
 
     if (restoreAgentConfig && this.voiceModeBaseConfig) {
       const baseConfig = this.voiceModeBaseConfig;
@@ -1024,7 +1127,19 @@ export class VoiceSession {
       return;
     }
 
-    await this.host.sendSpokenInput(agentId, result.text);
+    const clientMessageId = this.responseMode === "autoSpeakFinal" ? uuidv4() : undefined;
+    if (clientMessageId) {
+      this.automaticFinalSpeechState = beginAutomaticFinalSpeechTurn(clientMessageId);
+    }
+    const accepted = await this.host.sendSpokenInput(
+      agentId,
+      result.text,
+      this.responseMode,
+      clientMessageId,
+    );
+    if (!accepted && this.responseMode === "autoSpeakFinal") {
+      this.automaticFinalSpeechState = clearAutomaticFinalSpeechTurn();
+    }
     await this.flushPendingAudioSegments("transcription complete");
   }
 
@@ -1077,6 +1192,7 @@ export class VoiceSession {
     );
 
     this.abortController.abort();
+    this.automaticFinalSpeechState = clearAutomaticFinalSpeechTurn();
     this.ttsManager.cancelPendingPlaybacks("abort request");
 
     // Voice abort should always interrupt active agent output immediately.
@@ -1181,6 +1297,7 @@ export class VoiceSession {
    */
   private createAbortController(): AbortController {
     this.abortController.abort();
+    this.automaticFinalSpeechState = clearAutomaticFinalSpeechTurn();
     this.abortController = new AbortController();
     this.ttsDebugStreams.clear();
     return this.abortController;

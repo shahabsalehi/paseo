@@ -4,7 +4,7 @@ import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { afterEach, describe, expect, test } from "vitest";
 
-import { loadConfig, resolveBundledWebUiDistDir } from "./config.js";
+import { loadConfig, resolveBundledWebUiDistDir, resolveVoiceResponseMode } from "./config.js";
 
 const roots: string[] = [];
 
@@ -24,6 +24,15 @@ describe("server config", () => {
 
     expect(desktopConfig.desktopManaged).toBe(true);
     expect(standaloneConfig.desktopManaged).toBe(false);
+  });
+
+  test("resolves voice response mode from defaults, persisted config, and env", () => {
+    expect(resolveVoiceResponseMode(undefined, undefined)).toBe("toolDirected");
+    expect(resolveVoiceResponseMode(undefined, "autoSpeakFinal")).toBe("autoSpeakFinal");
+    expect(resolveVoiceResponseMode("toolDirected", "autoSpeakFinal")).toBe("toolDirected");
+    expect(() => resolveVoiceResponseMode("fallback", undefined)).toThrow(
+      "Invalid PASEO_VOICE_RESPONSE_MODE: fallback. Expected toolDirected or autoSpeakFinal.",
+    );
   });
 
   test("resolves bundled web UI path from source-tree modules", () => {
