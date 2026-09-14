@@ -76,7 +76,10 @@ interface FinishNotificationScenario {
 function createFinishNotificationScenario(
   options?: FinishNotificationScenarioOptions,
 ): FinishNotificationScenario {
-  let subscriber: ((event: AgentManagerEvent) => void) | null = null;
+  const subscribers = new Set<(event: AgentManagerEvent) => void>();
+  const subscriber = (event: AgentManagerEvent) => {
+    for (const callback of subscribers) callback(event);
+  };
   let resolveParentPrompt: ((prompt: string) => void) | null = null;
   let parentPrompted = false;
   let steerAttemptCount = 0;
@@ -105,9 +108,9 @@ function createFinishNotificationScenario(
     return null;
   });
   Reflect.set(agentManager, "subscribe", (callback: (event: AgentManagerEvent) => void) => {
-    subscriber = callback;
+    subscribers.add(callback);
     return () => {
-      subscriber = null;
+      subscribers.delete(callback);
     };
   });
   Reflect.set(agentManager, "getLastAssistantMessage", async () => {
@@ -432,13 +435,24 @@ test("detaching a child ends its parent-owned finish notification", async () => 
   expect(scenario.wasParentPrompted()).toBe(false);
 });
 
-test("follow-up finish notifications do not require a parent relationship", async () => {
+test("follow-up results do not subscribe a reporter to an unrelated or parent run", async () => {
   const scenario = createFinishNotificationScenario({ childParentAgentId: "another-agent" });
 
   scenario.startWatchingChild();
-  const parentPrompt = await scenario.finishChildAndReadParentPrompt();
+  scenario.finishChild();
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  expect(scenario.parentPrompts()).toEqual([]);
+});
 
-  expect(parentPrompt).toContain("Agent child-agent (Child Agent) finished.");
+test("repeated follow-ups produce one completion notification", async () => {
+  const scenario = createFinishNotificationScenario();
+  scenario.startWatchingChild();
+  scenario.startWatchingChild();
+  scenario.startWatchingChild();
+  scenario.finishChild();
+  await vi.waitFor(() => expect(scenario.parentPrompts()).toHaveLength(1));
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  expect(scenario.parentPrompts()).toHaveLength(1);
 });
 
 test("finish notifications wait for a busy parent without attempting replacement", async () => {

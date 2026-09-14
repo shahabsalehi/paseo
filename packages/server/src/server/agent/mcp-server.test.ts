@@ -3685,6 +3685,10 @@ describe("send_agent_prompt MCP tool", () => {
 
   it("defaults agent-scoped prompts to background finish notifications", async () => {
     const { agentManager, agentStorage, spies } = createTestDeps();
+    spies.agentStorage.get.mockResolvedValue({
+      id: "child-agent",
+      labels: { "paseo.parent-agent-id": "parent-agent" },
+    });
     const parentAgent = {
       id: "parent-agent",
       cwd: existingCwd,
@@ -3739,6 +3743,41 @@ describe("send_agent_prompt MCP tool", () => {
       "You will get notified when the prompted agent finishes, errors, or needs permission. Do not poll for status; continue with other work until the notification arrives.",
     );
   });
+
+  it.each([false, true])(
+    "does not attach a watcher for upward reports or opted-out tasks (%s)",
+    async (upward) => {
+      const { agentManager, agentStorage, spies } = createTestDeps();
+      spies.agentManager.isDispatchOwnershipEnabled = () => true;
+      const caller = { id: "caller", labels: upward ? { "paseo.parent-agent-id": "target" } : {} };
+      const target = {
+        id: "target",
+        lifecycle: "running",
+        labels: upward ? {} : { "paseo.parent-agent-id": "caller" },
+        config: { title: "Target" },
+        pendingPermissions: new Map(),
+      };
+      spies.agentManager.getAgent.mockImplementation(
+        (id: string) => (id === "caller" ? caller : target) as ManagedAgent,
+      );
+      spies.agentStorage.get.mockResolvedValue(target);
+      const server = await createAgentMcpServer({
+        agentManager,
+        agentStorage,
+        providerSnapshotManager: createOpenCodeManager().manager,
+        callerAgentId: "caller",
+        logger,
+      });
+      const response = await registeredTool(server, "send_agent_prompt").handler({
+        agentId: "target",
+        prompt: "Result",
+        background: true,
+        notifyOnFinish: upward,
+      });
+      expect(spies.agentManager.subscribe).not.toHaveBeenCalled();
+      expect(response.structuredContent.guidance).toBeUndefined();
+    },
+  );
 
   it("keeps top-level prompts blocking by default", async () => {
     const { agentManager, agentStorage, spies } = createTestDeps();

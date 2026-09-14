@@ -33,9 +33,15 @@ its existing dispatch queue and retries it; a refusal does not create an automat
 
 The same mode closes durable idle workers after two minutes and retains at most two warm idle
 workers between sweeps. The sweep runs every 30 seconds, excludes active runs, pending permissions,
-and running provider children, and rechecks under the lifecycle lock. Interactive roots and EAs
-retain their runtimes. Failed termination retains its capacity reservation. Root sessions still
+and running provider children, and rechecks under the lifecycle lock. Idle root and child sessions
+remain resumable after runtime release. Failed termination retains its capacity reservation. Roots still
 count against the global resident ceiling; opening many root chats can therefore defer launches.
+
+Roots dispatch bounded tasks directly through native tools. Legacy executive-assistant labels
+grant no dispatch or capacity privilege. Workers cannot create children or schedules. Completion
+notifications go only from a child to its parent, with one active subscription per pair; reporting
+upward does not subscribe the worker to its parent's next completion. `notifyOnFinish: false` is
+respected. Operations installs leave automatic dispatch-queue wake disabled.
 
 `PASEO_CAPACITY_COMMAND` names an absolute executable that checks memory without calling back into
 the daemon (`PA_CAPACITY_MEMORY_ONLY=1`). A failed or timed-out check defers a launch. The existing

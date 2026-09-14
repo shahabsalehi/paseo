@@ -14,17 +14,16 @@ function check(
     tool,
     target,
     labels,
-    hasExecutiveAssistant: caller.id === "root",
-    workerCount: 0,
   });
 }
-test("EA retains dispatch ownership across subsequent root and worker calls", () => {
-  check(ea, "create_agent");
-  check(ea, "send_agent_prompt", worker);
+test("root dispatches directly; legacy EA labels confer no privileges", () => {
+  check(root, "create_agent");
+  check(root, "create_agent");
+  expect(() => check(ea, "create_agent")).toThrow();
+  expect(() => check(ea, "send_agent_prompt", worker)).toThrow();
   check(root, "send_agent_prompt", ea);
   check(ea, "send_agent_prompt", root);
   check(worker, "send_agent_prompt", ea);
-  expect(() => check(root, "create_agent")).toThrow("executive assistant");
   expect(() => check(root, "send_agent_prompt", worker)).toThrow();
   expect(() => check(worker, "create_agent")).toThrow();
   expect(() => check(worker, "create_schedule")).toThrow();

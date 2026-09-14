@@ -35,13 +35,10 @@ export function assertDispatchOwnership(input: {
   tool: string;
   target: DispatchAgent | null;
   labels: Record<string, string>;
-  hasExecutiveAssistant: boolean;
-  workerCount: number;
 }): void {
-  const { caller, tool, target, labels, hasExecutiveAssistant, workerCount } = input;
+  const { caller, tool, target, labels } = input;
   const parent = caller.labels[PARENT_AGENT_ID_LABEL];
-  const executive = caller.labels.role === "executive-assistant";
-  const worker = Boolean(parent) && !executive;
+  const worker = Boolean(parent);
   if (
     tool === "update_agent" &&
     Object.keys(labels).some((key) => key === "role" || key === PARENT_AGENT_ID_LABEL)
@@ -50,8 +47,10 @@ export function assertDispatchOwnership(input: {
       "Dispatch roles and parentage cannot be changed by an agent tool.",
     );
   }
-  if (tool === "create_agent") {
-    assertCreateOwnership({ worker, executive, hasExecutiveAssistant, workerCount, labels });
+  if (tool === "create_agent" && worker) {
+    throw new DispatchOwnershipError(
+      "Workers cannot create agents; return the task to the parent.",
+    );
   }
   if (worker && automation.has(tool)) {
     throw new DispatchOwnershipError("Workers cannot schedule or dispatch further work.");
@@ -66,35 +65,6 @@ export function assertDispatchOwnership(input: {
   }
   if (target.labels[PARENT_AGENT_ID_LABEL] !== caller.id) {
     throw new DispatchOwnershipError("An agent may only control its own direct children.");
-  }
-  if (!executive && hasExecutiveAssistant && target.labels.role !== "executive-assistant") {
-    throw new DispatchOwnershipError("Worker control belongs to your executive assistant.");
-  }
-}
-
-function assertCreateOwnership(input: {
-  worker: boolean;
-  executive: boolean;
-  hasExecutiveAssistant: boolean;
-  workerCount: number;
-  labels: Record<string, string>;
-}): void {
-  const { worker, executive, hasExecutiveAssistant, workerCount, labels } = input;
-  if (worker)
-    throw new DispatchOwnershipError(
-      "Workers cannot create agents; return the task to your dispatcher.",
-    );
-  if (labels.role === "executive-assistant") {
-    if (executive || hasExecutiveAssistant)
-      throw new DispatchOwnershipError(
-        "Only a root without an executive assistant may create one.",
-      );
-    return;
-  }
-  if (!executive && (hasExecutiveAssistant || workerCount >= 1)) {
-    throw new DispatchOwnershipError(
-      "Send the approved work plan to your executive assistant for dispatch.",
-    );
   }
 }
 

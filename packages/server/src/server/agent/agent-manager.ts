@@ -814,10 +814,8 @@ export class AgentManager {
   }
 
   private isWorker(labels: Record<string, string> = {}): boolean {
-    return (
-      Boolean(
-        labels[PARENT_AGENT_ID_LABEL] || labels["paseo.schedule-id"] || labels.role === "worker",
-      ) && labels.role !== "executive-assistant"
+    return Boolean(
+      labels[PARENT_AGENT_ID_LABEL] || labels["paseo.schedule-id"] || labels.role === "worker",
     );
   }
 

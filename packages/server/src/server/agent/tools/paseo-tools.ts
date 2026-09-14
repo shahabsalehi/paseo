@@ -606,11 +606,6 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
               })
               .passthrough()
               .parse(input);
-            const records = await agentStorage.list();
-            const children = records.filter(
-              (record) =>
-                record.labels["paseo.parent-agent-id"] === callerAgentId && !record.archivedAt,
-            );
             const target = args.agentId
               ? (agentManager.getAgent(args.agentId) ?? (await agentStorage.get(args.agentId)))
               : null;
@@ -619,11 +614,6 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
               tool: name,
               target,
               labels: args.labels,
-              hasExecutiveAssistant: children.some(
-                (child) => child.labels.role === "executive-assistant",
-              ),
-              workerCount: children.filter((child) => child.labels.role !== "executive-assistant")
-                .length,
             });
           }
           return handler(input, context);
@@ -1933,7 +1923,8 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
       const shouldNotifyOnFinish = Boolean(
         callerAgentId &&
         background &&
-        (notifyOnFinish || agentManager.isDispatchOwnershipEnabled()),
+        notifyOnFinish &&
+        (await agentStorage.get(agentId))?.labels["paseo.parent-agent-id"] === callerAgentId,
       );
 
       await sendPromptToAgent({
@@ -1951,6 +1942,7 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
           agentStorage,
           childAgentId: agentId,
           callerAgentId,
+          requireParentOwnership: true,
           logger: childLogger,
         });
       }

@@ -517,15 +517,25 @@ interface NotifySafelyOptions {
   permissionRequest?: AgentPermissionRequest;
 }
 
+const finishSubscriptions = new WeakMap<AgentManager, Map<string, () => void>>();
+
 export function setupFinishNotification(params: SetupFinishNotificationParams): void {
   const {
     agentManager,
     agentStorage,
     childAgentId,
     callerAgentId,
-    requireParentOwnership = false,
+    requireParentOwnership = true,
     logger,
   } = params;
+  let subscriptions = finishSubscriptions.get(agentManager);
+  if (!subscriptions) {
+    subscriptions = new Map();
+    finishSubscriptions.set(agentManager, subscriptions);
+  }
+  const subscriptionKey = `${callerAgentId}:${childAgentId}`;
+  subscriptions.get(subscriptionKey)?.();
+  subscriptions.set(subscriptionKey, stop);
   const notificationId = randomUUID();
   let notificationSequence = 0;
   const inbox = initializeAgentNotifications(agentManager, agentStorage, logger);
@@ -540,12 +550,14 @@ export function setupFinishNotification(params: SetupFinishNotificationParams): 
     if (stopped) return;
     stopped = true;
     unsubscribe?.();
+    if (subscriptions?.get(subscriptionKey) === stop) subscriptions.delete(subscriptionKey);
   }
 
   async function notify(
     reason: FinishNotificationReason,
     permissionRequest?: AgentPermissionRequest,
   ): Promise<void> {
+    if (stopped) return;
     const callerRecord = await agentStorage.get(callerAgentId);
     if (callerRecord?.archivedAt) {
       return;
@@ -565,6 +577,7 @@ export function setupFinishNotification(params: SetupFinishNotificationParams): 
       permissionRequest,
     });
 
+    if (stopped) return;
     await inbox.enqueue({
       id: `${notificationId}:${++notificationSequence}:${reason}:${permissionRequest?.id ?? "terminal"}`,
       agentId: callerAgentId,
