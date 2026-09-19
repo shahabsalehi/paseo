@@ -39,7 +39,7 @@ test("idle worker closes without archiving and resumes the same durable session"
       type: "assistant_message",
       text: "Completed evidence",
     });
-    await manager.closeIdleRuntimes(Date.now() + 121_000);
+    await manager.closeIdleRuntimes(Date.now() + 901_000);
     expect(closed).toBe(1);
     expect(manager.getAgent(worker.id)).toBeNull();
     const stored = await storage.get(worker.id);
@@ -96,7 +96,7 @@ test.each(
         type: "assistant_message",
         text: "Keep this history",
       });
-      await manager.closeIdleRuntimes(Date.now() + 121_000);
+      await manager.closeIdleRuntimes(Date.now() + 901_000);
       expect(manager.getAgent(agent.id)).toBeNull();
       expect((await storage.get(agent.id))?.archivedAt).toBeFalsy();
       const history = await manager.readHistorySnapshot(agent.id);

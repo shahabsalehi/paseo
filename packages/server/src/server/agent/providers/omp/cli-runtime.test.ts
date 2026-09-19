@@ -99,6 +99,46 @@ function withoutRequestId(command: Record<string, unknown>): Record<string, unkn
 }
 
 describe("OMP CLI runtime", () => {
+  test.runIf(process.platform === "linux")(
+    "owns the OMP process tree in an agent systemd unit",
+    async () => {
+      const previous = process.env.PASEO_AGENT_SYSTEMD_SCOPE;
+      process.env.PASEO_AGENT_SYSTEMD_SCOPE = "1";
+      const child = createOmpChild();
+      const launches: OmpRuntimeLaunch[] = [];
+      const stopped: string[] = [];
+      const runtime = new OmpCliRuntime({
+        logger: pino({ level: "silent" }),
+        command: ["omp"],
+        spawnProcess: (launch) => {
+          launches.push(launch);
+          return child;
+        },
+        stopSystemdUnit: async (unitName) => {
+          stopped.push(unitName);
+        },
+      });
+
+      try {
+        const session = await runtime.startSession({
+          cwd: "/workspace/project",
+          env: { PASEO_AGENT_ID: "agent-123" },
+        });
+        expect(launches[0]?.argv[0]).toBe("systemd-run");
+        expect(launches[0]?.argv).toContain("--unit=paseo-agent-agent-123.scope");
+        expect(launches[0]?.argv).toContain("--slice=paseo-agents.slice");
+        expect(launches[0]?.argv).toContain("--property=KillMode=control-group");
+        const separator = launches[0]?.argv.indexOf("--") ?? -1;
+        expect(launches[0]?.argv[separator + 1]).toBe("omp");
+        await session.close();
+        expect(stopped).toEqual(["paseo-agent-agent-123.scope"]);
+      } finally {
+        if (previous === undefined) delete process.env.PASEO_AGENT_SYSTEMD_SCOPE;
+        else process.env.PASEO_AGENT_SYSTEMD_SCOPE = previous;
+      }
+    },
+  );
+
   test("uses the configured RPC timeout and attributes the pending phase", async () => {
     vi.useFakeTimers();
     const child = createOmpChild();

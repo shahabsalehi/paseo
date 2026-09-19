@@ -28,10 +28,10 @@ replacement. Once closure succeeds, a failed resume leaves the durable agent clo
 With `PASEO_RUNTIME_LIMITS=1`, the daemon bounds provider residency across providers: eight
 resident sessions, with two slots reserved from workers for coordinators; four executing workers
 and six executing sessions overall. Creation, persisted resume, imports, and scheduled creation
-reserve a slot before provider launch. Capacity refusal is explicit: the caller retains the task in
-its existing dispatch queue and retries it; a refusal does not create an automatic retry job.
+reserve a slot before provider launch. Capacity refusal is explicit and does not create an automatic
+retry job.
 
-The same mode closes durable idle workers after two minutes and retains at most two warm idle
+The same mode closes durable idle workers after fifteen minutes and retains at most two warm idle
 workers between sweeps. The sweep runs every 30 seconds, excludes active runs, pending permissions,
 and running provider children, and rechecks under the lifecycle lock. Idle root and child sessions
 remain resumable after runtime release. Failed termination retains its capacity reservation. Roots still
@@ -48,20 +48,24 @@ the daemon (`PA_CAPACITY_MEMORY_ONLY=1`). A failed or timed-out check defers a l
 host service limits remain the hard memory boundary; process counts cannot bound arbitrary shell
 commands or browser memory inside a worker.
 
-Managed dispatch enforces ownership at every agent tool call using durable parent/role labels.
-A root may directly create one worker for a small task. Once it creates an agent labeled
-`role=executive-assistant`, worker creation and control go through that EA. Workers may report to
-their parent but cannot create agents or schedules, or modify dispatch roles. Creation checks are
-serialized to prevent concurrent calls from creating duplicate EAs. User-facing daemon operations
-retain their normal authorization. Full shell access is not a security sandbox against an agent
-that deliberately bypasses the control plane.
+Managed dispatch enforces ownership at every agent tool call using durable parent labels. A root may
+directly create one worker for a bounded task. Workers may report to their parent but cannot create
+agents or schedules, modify dispatch roles, or control siblings. User-facing daemon operations retain
+their normal authorization. Full shell access is not a security sandbox against an agent that
+deliberately bypasses the control plane.
 
 Set `PASEO_OMP_DISPATCH_CONFIG` to the absolute OMP settings overlay containing
 `task.maxRecursionDepth: 0` (nested YAML). It is appended after other OMP launch arguments on both
 create and resume. Managed Codex sessions disable `multi_agent` and `multi_agent_v2` in their launch
-configuration. Paseo children use the normal finish notification path to their owning EA.
+configuration. Paseo children use the normal finish notification path to their owning parent.
 
-Without this opt-in, idle sessions retain the standard explicit-close lifecycle.
+On Linux, `PASEO_AGENT_SYSTEMD_SCOPE=1` launches each OMP runtime in a transient user scope named
+for its Paseo agent inside `paseo-agents.slice`. The scope uses control-group shutdown and binds to
+`paseo.service`, so Gradle, language servers, and other descendants stop with the runtime even when
+they daemonize. The shared slice keeps the aggregate agent processes under the host memory limits.
+
+Without these opt-ins, idle sessions retain the standard explicit-close lifecycle and OMP runs as a
+normal daemon child process.
 
 A provider runtime can still die on its own — crash, OOM kill, host suspend. Work the agent parked
 inside that process dies with it: Claude Code's background Bash shells, `Monitor` watches, and
