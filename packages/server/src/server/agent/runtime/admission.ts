@@ -11,7 +11,7 @@ export class UnconfirmedRuntimeCloseError extends Error {
 export class RuntimeCapacityError extends Error {
   constructor(public readonly reason: string) {
     super(
-      `Dispatch deferred: ${reason}. No new provider work was started; retry through the dispatch queue.`,
+      `Dispatch deferred: ${reason}. No new provider work was started; retry when capacity is available.`,
     );
     this.name = "RuntimeCapacityError";
   }
@@ -33,7 +33,7 @@ export const DEFAULT_RUNTIME_LIMITS = {
   coordinatorReserve: 2,
   maxExecuting: 6,
   maxWorkers: 4,
-  idleMs: 120_000,
+  idleMs: 900_000,
   maxWarmRuntimes: 2,
 };
 

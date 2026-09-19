@@ -1,6 +1,7 @@
 import type { ChildProcessWithoutNullStreams } from "node:child_process";
 import type { Logger } from "pino";
 
+import { execCommand } from "../../../../utils/spawn.js";
 import type { ProviderRuntimeSettings } from "../../provider-launch-config.js";
 import { JsonlRpcProcess, type JsonlRpcLaunch } from "../jsonl-rpc-process.js";
 import { establishOmpProtocol } from "./protocol-session.js";
@@ -50,6 +51,44 @@ export interface OmpCliRuntimeOptions {
   readyTimeoutMs?: number;
   requestTimeoutMs?: number;
   spawnProcess?: (launch: OmpRuntimeLaunch) => ChildProcessWithoutNullStreams;
+  stopSystemdUnit?: (unitName: string) => Promise<void>;
+}
+
+function managedOmpLaunch(launch: OmpRuntimeLaunch): {
+  launch: OmpRuntimeLaunch;
+  unitName?: string;
+} {
+  const agentId = launch.env?.PASEO_AGENT_ID;
+  if (process.platform !== "linux" || process.env.PASEO_AGENT_SYSTEMD_SCOPE !== "1" || !agentId) {
+    return { launch };
+  }
+
+  const unitName = `paseo-agent-${agentId.replace(/[^a-zA-Z0-9_.-]/g, "-")}.scope`;
+  return {
+    unitName,
+    launch: {
+      ...launch,
+      argv: [
+        "systemd-run",
+        "--user",
+        "--scope",
+        "--collect",
+        "--quiet",
+        `--unit=${unitName}`,
+        "--slice=paseo-agents.slice",
+        "--same-dir",
+        "--property=BindsTo=paseo.service",
+        "--property=KillMode=control-group",
+        "--property=TimeoutStopSec=5s",
+        "--",
+        ...launch.argv,
+      ],
+    },
+  };
+}
+
+async function stopSystemdUnit(unitName: string): Promise<void> {
+  await execCommand("systemctl", ["--user", "stop", unitName], { timeout: 10_000 });
 }
 
 export class OmpCliRuntime implements OmpRuntime {
@@ -64,11 +103,12 @@ export class OmpCliRuntime implements OmpRuntime {
   }
 
   async startSession(input: OmpStartSessionInput): Promise<OmpRuntimeSession> {
-    const launch = buildOmpLaunch({
+    const baseLaunch = buildOmpLaunch({
       command: this.command,
       runtimeSettings: this.options.runtimeSettings,
       session: input,
     });
+    const { launch, unitName } = managedOmpLaunch(baseLaunch);
     const [command, ...args] = launch.argv;
     const processLaunch: JsonlRpcLaunch = {
       command,
@@ -85,7 +125,32 @@ export class OmpCliRuntime implements OmpRuntime {
       ...(spawn ? { spawn: () => spawn(launch) } : {}),
     };
     const process = new JsonlRpcProcess(processOptions);
-    const handleAbort = () => void process.close(input.signal?.reason).catch(() => undefined);
+    let managedUnitStopped = false;
+    const stopManagedUnit = unitName
+      ? async () => {
+          if (managedUnitStopped) return;
+          managedUnitStopped = true;
+          try {
+            await (this.options.stopSystemdUnit ?? stopSystemdUnit)(unitName);
+          } catch (error) {
+            this.options.logger.warn(
+              { err: error, unitName },
+              "Failed to stop OMP systemd runtime unit",
+            );
+          }
+        }
+      : undefined;
+    const close = async (error?: unknown) => {
+      try {
+        let closeError: Error | undefined;
+        if (error !== undefined)
+          closeError = error instanceof Error ? error : new Error(String(error));
+        await process.close(closeError);
+      } finally {
+        await stopManagedUnit?.();
+      }
+    };
+    const handleAbort = () => void close(input.signal?.reason).catch(() => undefined);
     input.signal?.addEventListener("abort", handleAbort, { once: true });
     try {
       await establishOmpProtocol(process, this.options.logger, {
@@ -93,10 +158,10 @@ export class OmpCliRuntime implements OmpRuntime {
         requestTimeoutMs: this.options.requestTimeoutMs,
       });
       input.signal?.throwIfAborted();
-      return new OmpCliRuntimeSession(process, this.commandsRpcName);
+      return new OmpCliRuntimeSession(process, this.commandsRpcName, stopManagedUnit);
     } catch (error) {
       const startupError = error instanceof Error ? error : new Error(String(error));
-      await process.close(startupError);
+      await close(startupError);
       throw startupError;
     } finally {
       input.signal?.removeEventListener("abort", handleAbort);
@@ -111,6 +176,7 @@ class OmpCliRuntimeSession implements OmpRuntimeSession {
   constructor(
     private readonly process: JsonlRpcProcess,
     private readonly commandsRpcName: "get_available_commands",
+    private readonly stopManagedUnit?: () => Promise<void>,
   ) {
     process.onMessage((message) => {
       const event = OmpRuntimeEventSchema.safeParse(message);
@@ -285,7 +351,11 @@ class OmpCliRuntimeSession implements OmpRuntimeSession {
   }
 
   async close(): Promise<void> {
-    await this.process.close(new Error("OMP RPC session is closed"));
+    try {
+      await this.process.close(new Error("OMP RPC session is closed"));
+    } finally {
+      await this.stopManagedUnit?.();
+    }
   }
 
   private request(command: OmpRpcCommand, timeoutMs?: number | null): Promise<unknown> {
